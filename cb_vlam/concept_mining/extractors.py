@@ -36,6 +36,21 @@ class BaseExtractor:
         raise NotImplementedError
 
 
+def _yaw_from_quaternion_wxyz(q) -> float:
+    """Extract yaw (rotation about z) from a nuScenes wxyz quaternion."""
+    w, x, y, z = q
+    return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+
+def _wrap_pi(angle: float) -> float:
+    """Wrap angle to [-pi, pi]."""
+    return float((angle + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def _clip(x: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, x)))
+
+
 class KinematicExtractor(BaseExtractor):
     """Pass A: extract kinematic concepts from ego pose telemetry.
 
@@ -49,16 +64,26 @@ class KinematicExtractor(BaseExtractor):
     def __init__(self,
                  max_speed_mps: float = 30.0,
                  max_accel_mps2: float = 5.0,
-                 max_yaw_rate_radps: float = np.pi / 4):
+                 max_yaw_rate_radps: float = np.pi / 4,
+                 stopped_speed_mps: float = 0.5,
+                 braking_accel_mps2: float = -1.0,
+                 turning_yaw_rate_radps: float = 0.1):
         super().__init__()
         self.max_speed_mps = max_speed_mps
         self.max_accel_mps2 = max_accel_mps2
         self.max_yaw_rate_radps = max_yaw_rate_radps
+        self.stopped_speed_mps = stopped_speed_mps
+        self.braking_accel_mps2 = braking_accel_mps2
+        self.turning_yaw_rate_radps = turning_yaw_rate_radps
 
     def extract(self,
                 ego_pose: Dict[str, Any],
                 prev_ego_pose: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
         """Extract kinematic concepts from one frame's ego pose.
+
+        Speed and yaw rate are planar finite differences between consecutive
+        ego poses; acceleration and speed delta need the previous frame's
+        derived speed, kept in self.prev_state.
 
         Args:
             ego_pose: nuScenes ego_pose record. Has 'translation' (xyz),
@@ -68,7 +93,57 @@ class KinematicExtractor(BaseExtractor):
         Returns:
             Dict with keys matching PASS_A_CONCEPTS schema.
         """
-        raise NotImplementedError
+        # First frame of a scene: nothing computable from a single pose.
+        # Seed prev_state with the current yaw so the next frame's yaw rate
+        # is well-defined, and return zeros.
+        if prev_ego_pose is None:
+            self.prev_state = {
+                "speed_mps": 0.0,
+                "yaw": _yaw_from_quaternion_wxyz(ego_pose["rotation"]),
+            }
+            return {
+                "ego_speed": 0.0,
+                "ego_acceleration": 0.0,
+                "ego_yaw_rate": 0.0,
+                "ego_speed_delta": 0.0,
+                "ego_stopped": 1.0,
+                "ego_braking": 0.0,
+                "ego_turning": 0.0,
+            }
+
+        dt = (ego_pose["timestamp"] - prev_ego_pose["timestamp"]) / 1e6
+        # Guard against pathological dt (would only happen on corrupt data).
+        if dt <= 0:
+            dt = 0.5
+
+        cur_xy = np.asarray(ego_pose["translation"][:2], dtype=np.float64)
+        prev_xy = np.asarray(prev_ego_pose["translation"][:2], dtype=np.float64)
+        speed_mps = float(np.linalg.norm(cur_xy - prev_xy) / dt)
+
+        cur_yaw = _yaw_from_quaternion_wxyz(ego_pose["rotation"])
+        prev_yaw = _yaw_from_quaternion_wxyz(prev_ego_pose["rotation"])
+        yaw_delta = _wrap_pi(cur_yaw - prev_yaw)
+        yaw_rate_radps = float(yaw_delta / dt)
+
+        prev_speed_mps = self.prev_state["speed_mps"] if self.prev_state else 0.0
+        accel_mps2 = float((speed_mps - prev_speed_mps) / dt)
+
+        # Normalize per schema bounds.
+        speed_norm = _clip(speed_mps / self.max_speed_mps, 0.0, 1.0)
+        prev_speed_norm = _clip(prev_speed_mps / self.max_speed_mps, 0.0, 1.0)
+
+        out = {
+            "ego_speed": speed_norm,
+            "ego_acceleration": _clip(accel_mps2 / self.max_accel_mps2, -1.0, 1.0),
+            "ego_yaw_rate": _clip(yaw_rate_radps / self.max_yaw_rate_radps, -1.0, 1.0),
+            "ego_speed_delta": speed_norm - prev_speed_norm,
+            "ego_stopped": 1.0 if speed_mps < self.stopped_speed_mps else 0.0,
+            "ego_braking": 1.0 if accel_mps2 < self.braking_accel_mps2 else 0.0,
+            "ego_turning": 1.0 if abs(yaw_rate_radps) > self.turning_yaw_rate_radps else 0.0,
+        }
+
+        self.prev_state = {"speed_mps": speed_mps, "yaw": cur_yaw}
+        return out
 
 
 class AgentExtractor(BaseExtractor):

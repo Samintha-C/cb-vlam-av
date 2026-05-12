@@ -1,0 +1,16 @@
+# Core
+numpy>=1.24
+torch>=2.0
+transformers>=4.40
+datasets>=2.14
+tqdm>=4.65
+
+# nuScenes dataset
+nuscenes-devkit>=1.1.10
+
+# Image handling
+Pillow>=10.0
+
+# Optional: VLM client for scene context extraction (Pass C).
+# Comment out if using a local VLM via transformers instead.
+anthropic>=0.40

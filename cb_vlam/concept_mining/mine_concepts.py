@@ -123,7 +123,11 @@ def mine(data_root: Path,
         vlm_backend: "anthropic" or "local" (only used if Pass C is enabled).
         vlm_model: VLM model name.
     """
-    loader = NuScenesLoader(data_root=data_root, version=version)
+    loader = NuScenesLoader(
+        data_root=data_root,
+        version=version,
+        load_images="c" in passes,
+    )
 
     kinematic = KinematicExtractor()
     agent = AgentExtractor()
