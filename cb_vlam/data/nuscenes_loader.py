@@ -34,7 +34,8 @@ class NuScenesLoader:
                  data_root: Path,
                  version: str = "v1.0-mini",
                  verbose: bool = True,
-                 load_images: bool = True):
+                 load_images: bool = True,
+                 load_maps: bool = True):
         """
         Args:
             data_root: Path to the nuScenes data root (containing v1.0-mini/, samples/, etc.).
@@ -43,11 +44,14 @@ class NuScenesLoader:
             load_images: If False, skip loading the front-camera image into memory
                 (front_image will be None). Path is still populated. Useful for
                 pass-A-only runs where the image isn't needed.
+            load_maps: If False, skip loading NuScenesMap (nusc_map will be None).
+                Pass A does not need maps; set False when only running kinematic extraction.
         """
         self.data_root = Path(data_root)
         self.version = version
         self.verbose = verbose
         self.load_images = load_images
+        self.load_maps = load_maps
         self._nusc = None
         self._maps: Dict[str, Any] = {}
 
@@ -103,7 +107,7 @@ class NuScenesLoader:
                 "scene_token": scene["token"],
                 "scene_name": scene["name"],
                 "location": location,
-                "nusc_map": self._get_map(location),
+                "nusc_map": self._get_map(location) if self.load_maps else None,
                 "first_sample_token": scene["first_sample_token"],
             }
 

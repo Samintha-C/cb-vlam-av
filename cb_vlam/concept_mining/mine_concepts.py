@@ -127,6 +127,7 @@ def mine(data_root: Path,
         data_root=data_root,
         version=version,
         load_images="c" in passes,
+        load_maps="b" in passes,
     )
 
     kinematic = KinematicExtractor()
