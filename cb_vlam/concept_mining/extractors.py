@@ -184,7 +184,137 @@ class AgentExtractor(BaseExtractor):
         Returns:
             Dict with keys matching PASS_B_AGENT_CONCEPTS schema.
         """
-        raise NotImplementedError
+        from pyquaternion import Quaternion
+
+        ego_t   = np.array(ego_pose["translation"][:3], dtype=np.float64)
+        ego_R_inv = Quaternion(ego_pose["rotation"]).inverse.rotation_matrix
+
+        def to_ego_frame(global_xyz):
+            """(x_forward, y_left, z_up) in ego vehicle frame."""
+            return ego_R_inv @ (np.array(global_xyz[:3]) - ego_t)
+
+        # dt and ego speed from stored previous state
+        dt = 0.5
+        ego_speed_mps = 0.0
+        if self.prev_state is not None:
+            dt = (ego_pose["timestamp"] - self.prev_state["timestamp"]) / 1e6
+            if dt <= 0:
+                dt = 0.5
+            ego_speed_mps = float(
+                np.linalg.norm(ego_t[:2] - self.prev_state["ego_t"][:2]) / dt
+            )
+
+        # Build instance-keyed lookup for prev frame velocity computation
+        prev_by_inst: Dict[str, Any] = {}
+        if prev_annotations is not None:
+            prev_by_inst = {a["instance_token"]: a for a in prev_annotations}
+
+        # Classify each annotation into a bucket
+        vehicles:    List[Dict] = []
+        pedestrians: List[Dict] = []
+        cyclists:    List[Dict] = []
+
+        for ann in annotations:
+            cat = ann["category_name"]
+            pos = to_ego_frame(ann["translation"])
+            dist = float(np.linalg.norm(pos[:2]))
+            entry = {"ann": ann, "pos": pos, "dist": dist}
+
+            if cat.startswith("vehicle.bicycle") or cat.startswith("vehicle.motorcycle"):
+                cyclists.append(entry)
+            elif cat.startswith("vehicle."):
+                vehicles.append(entry)
+            elif cat.startswith("human.pedestrian"):
+                pedestrians.append(entry)
+
+        # ── Lead vehicle ──────────────────────────────────────────────────────
+        half_lane = self.lane_width_m / 2.0
+        lead_candidates = [
+            v for v in vehicles
+            if 0 < v["pos"][0] < self.lead_vehicle_max_distance_m
+            and abs(v["pos"][1]) < half_lane
+        ]
+
+        lead_vel_fwd = 0.0   # forward velocity of lead in ego frame (m/s)
+
+        if lead_candidates:
+            lead = min(lead_candidates, key=lambda v: v["pos"][0])
+            inst  = lead["ann"]["instance_token"]
+
+            # Lead longitudinal velocity from instance tracking
+            if inst in prev_by_inst:
+                global_delta = (
+                    np.array(lead["ann"]["translation"][:3])
+                    - np.array(prev_by_inst[inst]["translation"][:3])
+                )
+                lead_vel_fwd = float((ego_R_inv @ global_delta)[0] / dt)
+
+            # Closing rate = ego advancing faster than lead (positive → approaching)
+            closing_rate = ego_speed_mps - lead_vel_fwd
+
+            # Lead decelerating: compare lead vel to previous frame's stored lead vel
+            prev_lead_vel = self.prev_state.get("lead_vel_fwd", 0.0) if self.prev_state else 0.0
+            lead_accel = (lead_vel_fwd - prev_lead_vel) / dt
+
+            out_lead = {
+                "lead_vehicle_present":           1.0,
+                "lead_vehicle_distance":          float(np.clip(lead["pos"][0] / self.lead_vehicle_max_distance_m, 0.0, 1.0)),
+                "lead_vehicle_relative_velocity": float(np.clip(closing_rate / 10.0, -1.0, 1.0)),
+                "lead_vehicle_decelerating":      1.0 if lead_accel < -1.0 else 0.0,
+            }
+        else:
+            out_lead = {
+                "lead_vehicle_present":           0.0,
+                "lead_vehicle_distance":          1.0,
+                "lead_vehicle_relative_velocity": 0.0,
+                "lead_vehicle_decelerating":      0.0,
+            }
+
+        # ── Pedestrians ───────────────────────────────────────────────────────
+        # pedestrian_in_crosswalk_ahead: without HD map we approximate as any
+        # pedestrian within 10 m ahead in the forward corridor (±4 m lateral).
+        peds_crosswalk = [
+            p for p in pedestrians
+            if 0 < p["pos"][0] < 10.0 and abs(p["pos"][1]) < 4.0
+        ]
+        nearest_ped_dist = min((p["dist"] for p in pedestrians), default=None)
+
+        out_ped = {
+            "pedestrian_in_crosswalk_ahead": 1.0 if peds_crosswalk else 0.0,
+            "nearest_pedestrian_distance":   float(np.clip(nearest_ped_dist / 30.0, 0.0, 1.0))
+                                             if nearest_ped_dist is not None else 1.0,
+        }
+
+        # ── Nearby vehicles & cyclists ────────────────────────────────────────
+        nearby_count = sum(1 for v in vehicles if v["dist"] < self.nearby_vehicle_range_m)
+        cyc_close    = any(c["dist"] < self.pedestrian_check_range_m for c in cyclists)
+
+        # Adjacent lane occupancy: check vehicles in the lateral band of the next lane
+        L = self.lane_width_m
+        left_blocked  = any(
+            v for v in vehicles
+            if L * 0.5 < v["pos"][1] < L * 2.5 and abs(v["pos"][0]) < 10.0
+        )
+        right_blocked = any(
+            v for v in vehicles
+            if -L * 2.5 < v["pos"][1] < -L * 0.5 and abs(v["pos"][0]) < 10.0
+        )
+
+        out_misc = {
+            "vehicle_count_nearby":  float(np.clip(nearby_count / 10.0, 0.0, 1.0)),
+            "cyclist_present":       1.0 if cyc_close else 0.0,
+            "left_lane_blocked":     1.0 if left_blocked  else 0.0,
+            "right_lane_blocked":    1.0 if right_blocked else 0.0,
+        }
+
+        # ── Update state ──────────────────────────────────────────────────────
+        self.prev_state = {
+            "timestamp":    ego_pose["timestamp"],
+            "ego_t":        ego_t.copy(),
+            "lead_vel_fwd": lead_vel_fwd,
+        }
+
+        return {**out_lead, **out_ped, **out_misc}
 
 
 class InfrastructureExtractor(BaseExtractor):
