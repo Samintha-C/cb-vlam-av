@@ -352,31 +352,83 @@ class InfrastructureExtractor(BaseExtractor):
         raise NotImplementedError
 
 
+_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def _build_pass_c_prompt() -> str:
+    """Build the structured prompt listing every Pass C concept and its options."""
+    from cb_vlam.concept_mining.schema import PASS_C_SCENE_CONCEPTS
+
+    categorical_lines = []
+    binary_lines = []
+    for c in PASS_C_SCENE_CONCEPTS:
+        if c["type"] == "categorical":
+            vals = "/".join(c["values"])
+            categorical_lines.append(f'- "{c["name"]}" (one of: {vals}) — {c["desc"]}')
+        else:
+            binary_lines.append(f'- "{c["name"]}" (true/false) — {c["desc"]}')
+
+    return (
+        "You are analyzing a front-camera image from an autonomous vehicle. "
+        "Extract the following concepts and return ONLY a valid JSON object — "
+        "no markdown fences, no commentary.\n\n"
+        "CATEGORICAL CONCEPTS (return the string value):\n"
+        + "\n".join(categorical_lines) + "\n\n"
+        "BINARY CONCEPTS (return true or false):\n"
+        + "\n".join(binary_lines) + "\n\n"
+        "Guidelines:\n"
+        "- 'lead vehicle' = the vehicle directly ahead of ego in the same lane.\n"
+        "- For categoricals with a 'none' option, return 'none' if not visible/applicable.\n"
+        "- Be conservative: if uncertain, return the default (false / 'none' / 'clear').\n"
+        "- Return every key from the lists above. Return ONLY the JSON object."
+    )
+
+
 class SceneContextExtractor(BaseExtractor):
-    """Pass C: extract scene context (weather, lighting, etc.) using a VLM.
+    """Pass C: extract scene context with a VLM.
 
-    Runs on keyframes only (1Hz, not 2Hz) and carries labels forward for
-    non-keyframe timestamps. The VLM is queried with a structured prompt
-    that asks for a JSON response covering all categorical concepts.
+    Currently supports the OpenRouter backend, which proxies many vendor APIs
+    (Gemini, Claude, GPT, etc.) behind a single OpenAI-compatible endpoint.
 
-    Supports two backends:
-    - "anthropic": uses the Anthropic API
-    - "local": uses a HuggingFace VLM (e.g., Qwen2-VL) via transformers
+    Categorical concepts are returned as integer indices into the schema's
+    `values` list. Binaries are returned as 0.0 or 1.0.
     """
 
     def __init__(self,
-                 backend: str = "anthropic",
-                 model_name: str = "claude-haiku-4-5",
-                 keyframe_stride: int = 2):
+                 backend: str = "openrouter",
+                 model_name: str = "google/gemini-2.5-flash",
+                 keyframe_stride: int = 1,
+                 max_image_dim: int = 1024,
+                 jpeg_quality: int = 85,
+                 request_timeout: int = 60):
         super().__init__()
         self.backend = backend
         self.model_name = model_name
         self.keyframe_stride = keyframe_stride
-        self._cached_labels: Optional[Dict[str, int]] = None
+        self.max_image_dim = max_image_dim
+        self.jpeg_quality = jpeg_quality
+        self.request_timeout = request_timeout
+        self._cached_labels: Optional[Dict[str, float]] = None
+        self._prompt = _build_pass_c_prompt()
+
+        # Build categorical lookup: name -> {value_string: index}
+        from cb_vlam.concept_mining.schema import PASS_C_SCENE_CONCEPTS
+        self._categorical_index: Dict[str, Dict[str, int]] = {}
+        self._binary_names: set = set()
+        for c in PASS_C_SCENE_CONCEPTS:
+            if c["type"] == "categorical":
+                self._categorical_index[c["name"]] = {v: i for i, v in enumerate(c["values"])}
+            elif c["type"] == "binary":
+                self._binary_names.add(c["name"])
 
     def reset(self) -> None:
         super().reset()
         self._cached_labels = None
+
+    def _defaults(self) -> Dict[str, float]:
+        """All-zero / first-category default values for every Pass C concept."""
+        from cb_vlam.concept_mining.schema import PASS_C_SCENE_CONCEPTS
+        return {c["name"]: 0.0 for c in PASS_C_SCENE_CONCEPTS}
 
     def extract(self,
                 image: np.ndarray,
@@ -384,20 +436,106 @@ class SceneContextExtractor(BaseExtractor):
         """Extract scene context concepts for one frame.
 
         Args:
-            image: Front camera RGB image (H, W, 3) uint8.
-            frame_index: Frame index within the scene (used for keyframe detection).
+            image: Front camera RGB image (H, W, 3) uint8, or None.
+            frame_index: Frame index within the scene.
 
         Returns:
             Dict with keys matching PASS_C_SCENE_CONCEPTS schema.
-            Categorical concepts are returned as integer indices into the
-            values list defined in the schema.
         """
-        raise NotImplementedError
+        if image is None:
+            return self._cached_labels.copy() if self._cached_labels else self._defaults()
 
-    def _query_vlm(self, image: np.ndarray) -> Dict[str, int]:
-        """Send image to VLM with structured prompt, parse JSON response.
+        # Carry-forward: only query VLM on keyframes (every `keyframe_stride`).
+        if frame_index % self.keyframe_stride != 0 and self._cached_labels is not None:
+            return self._cached_labels.copy()
 
-        Returns:
-            Dict mapping concept name to integer category index.
-        """
-        raise NotImplementedError
+        try:
+            raw = self._query_vlm(image)
+            labels = self._raw_to_concepts(raw)
+            self._cached_labels = labels
+            return labels.copy()
+        except Exception as e:
+            print(f"[pass-c] VLM call failed at frame {frame_index}: {e}")
+            return self._cached_labels.copy() if self._cached_labels else self._defaults()
+
+    def _raw_to_concepts(self, raw: Dict[str, Any]) -> Dict[str, float]:
+        """Convert the parsed JSON response into a dict of float concept values."""
+        out = self._defaults()
+        for name, val in raw.items():
+            if name in self._categorical_index:
+                idx_map = self._categorical_index[name]
+                if isinstance(val, str) and val.lower() in idx_map:
+                    out[name] = float(idx_map[val.lower()])
+            elif name in self._binary_names:
+                if isinstance(val, bool):
+                    out[name] = 1.0 if val else 0.0
+                elif isinstance(val, (int, float)):
+                    out[name] = 1.0 if val else 0.0
+                elif isinstance(val, str):
+                    out[name] = 1.0 if val.lower() in ("true", "yes", "1") else 0.0
+        return out
+
+    def _query_vlm(self, image: np.ndarray) -> Dict[str, Any]:
+        """Send image to VLM via OpenRouter; return the parsed JSON dict."""
+        import base64
+        import json
+        import os
+        import time
+        from io import BytesIO
+
+        import requests
+        from PIL import Image
+
+        if self.backend != "openrouter":
+            raise NotImplementedError(f"Backend {self.backend!r} not implemented")
+
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENROUTER_API_KEY env var not set")
+
+        # Resize + JPEG-encode to keep image tokens manageable
+        pil = Image.fromarray(image)
+        pil.thumbnail((self.max_image_dim, self.max_image_dim))
+        buf = BytesIO()
+        pil.save(buf, format="JPEG", quality=self.jpeg_quality)
+        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        payload = {
+            "model": self.model_name,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": self._prompt},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                ],
+            }],
+            "response_format": {"type": "json_object"},
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
+            "HTTP-Referer":  "https://github.com/Samintha-C/cb-vlam-av",
+            "X-Title":       "cb-vlam-av",
+        }
+
+        # Up to 3 attempts with exponential backoff for rate-limit / transient errors
+        last_err = None
+        for attempt in range(3):
+            try:
+                r = requests.post(_OPENROUTER_URL, headers=headers, json=payload,
+                                  timeout=self.request_timeout)
+                if r.status_code == 429 or r.status_code >= 500:
+                    last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+                    time.sleep(2 ** attempt)
+                    continue
+                r.raise_for_status()
+                content = r.json()["choices"][0]["message"]["content"]
+                # Strip stray markdown fences if present
+                content = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                return json.loads(content)
+            except Exception as e:
+                last_err = str(e)
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+        raise RuntimeError(f"VLM query failed after 3 attempts: {last_err}")

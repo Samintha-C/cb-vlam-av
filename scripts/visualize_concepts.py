@@ -23,21 +23,34 @@ from PIL import Image
 from datasets import load_from_disk
 
 
-_BINARY_CONCEPTS = {
-    "ego_stopped", "ego_braking", "ego_turning",
-    "lead_vehicle_present", "lead_vehicle_decelerating",
-    "pedestrian_in_crosswalk_ahead", "cyclist_present",
-    "left_lane_blocked", "right_lane_blocked",
-    "approaching_intersection", "lane_available_left",
-    "lane_available_right", "in_intersection",
-}
+from cb_vlam.concept_mining.schema import get_all_concepts
+
+_CONCEPT_INFO = {c["name"]: c for c in get_all_concepts()}
+_BINARY_CONCEPTS = {n for n, c in _CONCEPT_INFO.items() if c["type"] == "binary"}
+_CATEGORICAL_CONCEPTS = {n: c["values"] for n, c in _CONCEPT_INFO.items() if c["type"] == "categorical"}
+
+
+def _categorical_label(name: str, val: float) -> str:
+    """Lookup the categorical string for a (concept, integer-index) pair."""
+    values = _CATEGORICAL_CONCEPTS.get(name, [])
+    idx = int(round(val))
+    if 0 <= idx < len(values):
+        return values[idx]
+    return f"?{idx}"
 
 
 def _render_page(record: dict, image_path: Path) -> plt.Figure:
     concepts: dict = record["concepts"]
     names = list(concepts.keys())
     values = [concepts[k] for k in names]
-    colors = ["steelblue" if n in _BINARY_CONCEPTS else "tomato" for n in names]
+
+    def color_for(n):
+        if n in _CATEGORICAL_CONCEPTS:
+            return "mediumseagreen"
+        if n in _BINARY_CONCEPTS:
+            return "steelblue"
+        return "tomato"
+    colors = [color_for(n) for n in names]
 
     fig, axes = plt.subplots(1, 2, figsize=(16, max(6, len(names) * 0.35)))
     fig.patch.set_facecolor("#1a1a2e")
@@ -64,25 +77,33 @@ def _render_page(record: dict, image_path: Path) -> plt.Figure:
     y = np.arange(len(names))
     bars = ax_bar.barh(y, values, color=colors, edgecolor="none", height=0.7)
 
-    for bar, val in zip(bars, values):
+    for bar, name, val in zip(bars, names, values):
+        if name in _CATEGORICAL_CONCEPTS:
+            txt = _categorical_label(name, val)
+        else:
+            txt = f"{val:.3f}"
         ax_bar.text(
             bar.get_width() + 0.02, bar.get_y() + bar.get_height() / 2,
-            f"{val:.3f}", va="center", ha="left", color="white", fontsize=7,
+            txt, va="center", ha="left", color="white", fontsize=7,
         )
 
     ax_bar.set_yticks(y)
-    ax_bar.set_yticklabels(names, fontsize=8, color="white")
-    ax_bar.set_xlim(-1.1, 1.25)
+    ax_bar.set_yticklabels(names, fontsize=7, color="white")
+    # x-range covers categorical indices too (up to 5 for speed_limit_sign)
+    max_cat = max((len(v) for v in _CATEGORICAL_CONCEPTS.values()), default=1)
+    ax_bar.set_xlim(-1.1, max(1.25, max_cat + 0.5))
     ax_bar.set_xlabel("Concept value", color="white", fontsize=9)
     ax_bar.tick_params(colors="white")
     for spine in ax_bar.spines.values():
         spine.set_edgecolor("#444466")
     ax_bar.axvline(0, color="#666688", linewidth=0.8)
-    ax_bar.set_title("Mined concepts (Pass A — kinematic)", color="white", fontsize=10, pad=6)
+    ax_bar.set_title("Mined concepts (A: kinematic, B: agents, C: VLM)",
+                     color="white", fontsize=10, pad=6)
 
     legend = [
-        mpatches.Patch(color="tomato",    label="continuous"),
-        mpatches.Patch(color="steelblue", label="binary"),
+        mpatches.Patch(color="tomato",         label="continuous"),
+        mpatches.Patch(color="steelblue",      label="binary"),
+        mpatches.Patch(color="mediumseagreen", label="categorical"),
     ]
     ax_bar.legend(handles=legend, loc="lower right", fontsize=8,
                   facecolor="#1a1a2e", edgecolor="none", labelcolor="white")

@@ -110,8 +110,8 @@ def mine(data_root: Path,
          output_path: Path,
          passes: List[str],
          max_scenes: Optional[int] = None,
-         vlm_backend: str = "anthropic",
-         vlm_model: str = "claude-haiku-4-5") -> None:
+         vlm_backend: str = "openrouter",
+         vlm_model: str = "google/gemini-2.5-flash") -> None:
     """Main mining loop.
 
     Args:
@@ -167,9 +167,9 @@ def main():
                         help="Which passes to run, e.g., 'a', 'ab', 'abc'")
     parser.add_argument("--max_scenes", type=int, default=None,
                         help="Limit number of scenes (for development)")
-    parser.add_argument("--vlm_backend", type=str, default="anthropic",
-                        choices=["anthropic", "local"])
-    parser.add_argument("--vlm_model", type=str, default="claude-haiku-4-5")
+    parser.add_argument("--vlm_backend", type=str, default="openrouter",
+                        choices=["openrouter", "anthropic", "local"])
+    parser.add_argument("--vlm_model", type=str, default="google/gemini-2.5-flash")
     args = parser.parse_args()
 
     passes = list(args.passes.lower())
