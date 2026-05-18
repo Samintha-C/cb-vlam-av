@@ -1,11 +1,13 @@
-"""Visualize mined concepts next to the front-camera image for a given sample.
+"""Visualize mined concepts next to the front-camera image.
+
+Produces a multi-page PDF — one page per sample — saved to --out.
 
 Usage:
     python scripts/visualize_concepts.py \
         --dataset_path ./outputs/pass_a_trainval_test \
-        --data_root /path/to/nuscenes \
-        --index 0 \
-        --out ./outputs/concept_vis.png
+        --data_root /sc-rwx-vol/cbvlam/nuscenes \
+        --n_samples 20 \
+        --out ./outputs/concepts.pdf
 """
 
 import argparse
@@ -15,12 +17,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 from PIL import Image
 from datasets import load_from_disk
 
 
-# Concepts that are binary (0.0 or 1.0) — rendered differently from continuous
 _BINARY_CONCEPTS = {
     "ego_stopped", "ego_braking", "ego_turning",
     "lead_vehicle_present", "lead_vehicle_decelerating",
@@ -31,54 +33,52 @@ _BINARY_CONCEPTS = {
 }
 
 
-def visualize(record: dict, image_path: Path, out_path: Path) -> None:
+def _render_page(record: dict, image_path: Path) -> plt.Figure:
     concepts: dict = record["concepts"]
     names = list(concepts.keys())
     values = [concepts[k] for k in names]
-
-    # Color: binary concepts in steel blue, continuous in coral
     colors = ["steelblue" if n in _BINARY_CONCEPTS else "tomato" for n in names]
 
     fig, axes = plt.subplots(1, 2, figsize=(16, max(6, len(names) * 0.35)))
     fig.patch.set_facecolor("#1a1a2e")
 
-    # ── Left: front camera image ──────────────────────────────────────────────
+    # Left: front camera image
     ax_img = axes[0]
     if image_path.exists():
-        img = np.asarray(Image.open(image_path).convert("RGB"))
-        ax_img.imshow(img)
+        ax_img.imshow(np.asarray(Image.open(image_path).convert("RGB")))
     else:
-        ax_img.text(0.5, 0.5, "image not available",
-                    ha="center", va="center", color="white", transform=ax_img.transAxes)
+        ax_img.text(0.5, 0.5, "image not extracted yet",
+                    ha="center", va="center", color="white", fontsize=10,
+                    transform=ax_img.transAxes)
+        ax_img.set_facecolor("#16213e")
     ax_img.axis("off")
     ax_img.set_title(
-        f"scene: {record['scene_token'][:8]}…\n"
-        f"t={record['timestamp']}  frame={record['frame_index']}",
-        color="white", fontsize=9, pad=6,
+        f"scene: {record['scene_token'][:12]}…  frame {record['frame_index']}\n"
+        f"sample: {record['sample_token'][:12]}…",
+        color="white", fontsize=8, pad=6,
     )
 
-    # ── Right: concept bar chart ──────────────────────────────────────────────
+    # Right: horizontal bar chart
     ax_bar = axes[1]
     ax_bar.set_facecolor("#16213e")
     y = np.arange(len(names))
     bars = ax_bar.barh(y, values, color=colors, edgecolor="none", height=0.7)
 
-    # Value labels at bar end
     for bar, val in zip(bars, values):
         ax_bar.text(
-            bar.get_width() + 0.01, bar.get_y() + bar.get_height() / 2,
-            f"{val:.2f}", va="center", ha="left", color="white", fontsize=7,
+            bar.get_width() + 0.02, bar.get_y() + bar.get_height() / 2,
+            f"{val:.3f}", va="center", ha="left", color="white", fontsize=7,
         )
 
     ax_bar.set_yticks(y)
     ax_bar.set_yticklabels(names, fontsize=8, color="white")
-    ax_bar.set_xlim(-1.05, 1.15)
+    ax_bar.set_xlim(-1.1, 1.25)
     ax_bar.set_xlabel("Concept value", color="white", fontsize=9)
     ax_bar.tick_params(colors="white")
     for spine in ax_bar.spines.values():
         spine.set_edgecolor("#444466")
     ax_bar.axvline(0, color="#666688", linewidth=0.8)
-    ax_bar.set_title("Mined concepts (Pass A)", color="white", fontsize=10, pad=6)
+    ax_bar.set_title("Mined concepts (Pass A — kinematic)", color="white", fontsize=10, pad=6)
 
     legend = [
         mpatches.Patch(color="tomato",    label="continuous"),
@@ -88,55 +88,50 @@ def visualize(record: dict, image_path: Path, out_path: Path) -> None:
                   facecolor="#1a1a2e", edgecolor="none", labelcolor="white")
 
     plt.tight_layout(pad=1.5)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close()
-    print(f"Saved → {out_path}")
+    return fig
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_path", required=True,
-                        help="Path to HuggingFace dataset saved by mine_concepts.py")
-    parser.add_argument("--data_root", required=True,
-                        help="nuScenes data root (for loading front camera images)")
-    parser.add_argument("--index", type=int, default=0,
-                        help="Record index in the dataset to visualize")
-    parser.add_argument("--sample_token", type=str, default=None,
-                        help="nuScenes sample_token to visualize (overrides --index)")
-    parser.add_argument("--out", type=str, default="./outputs/concept_vis.png")
+    parser.add_argument("--dataset_path", required=True)
+    parser.add_argument("--data_root",    required=True)
+    parser.add_argument("--version",      default="v1.0-trainval")
+    parser.add_argument("--n_samples",    type=int, default=20,
+                        help="Number of samples to include in the PDF")
+    parser.add_argument("--out",          default="./outputs/concepts.pdf")
     args = parser.parse_args()
 
     ds = load_from_disk(args.dataset_path)
+    n = min(args.n_samples, len(ds))
+    print(f"Dataset: {len(ds)} records. Rendering {n} pages.")
 
-    if args.sample_token:
-        matches = [i for i, r in enumerate(ds) if r["sample_token"] == args.sample_token]
-        if not matches:
-            raise ValueError(f"sample_token {args.sample_token!r} not found in dataset")
-        idx = matches[0]
-    else:
-        idx = args.index
-
-    record = ds[idx]
-    print(f"Visualizing index={idx}  sample_token={record['sample_token']}")
-    print(f"Concepts: {record['concepts']}")
-
-    # Resolve front camera image path from nuScenes sample_data
+    # Load nuScenes once for image path resolution
     try:
         from nuscenes.nuscenes import NuScenes
-        nusc = NuScenes(
-            version="v1.0-trainval",
-            dataroot=args.data_root,
-            verbose=False,
-        )
-        sample = nusc.get("sample", record["sample_token"])
-        cam_sd = nusc.get("sample_data", sample["data"]["CAM_FRONT"])
-        image_path = Path(args.data_root) / cam_sd["filename"]
+        nusc = NuScenes(version=args.version, dataroot=args.data_root, verbose=False)
+        def get_image_path(sample_token: str) -> Path:
+            sample  = nusc.get("sample", sample_token)
+            cam_sd  = nusc.get("sample_data", sample["data"]["CAM_FRONT"])
+            return Path(args.data_root) / cam_sd["filename"]
     except Exception as e:
-        print(f"Warning: could not load image path from nuScenes ({e}). Rendering without image.")
-        image_path = Path("/nonexistent")
+        print(f"Warning: nuScenes load failed ({e}). Rendering without images.")
+        def get_image_path(_: str) -> Path:
+            return Path("/nonexistent")
 
-    visualize(record, image_path, Path(args.out))
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with PdfPages(out_path) as pdf:
+        for i in range(n):
+            record = ds[i]
+            image_path = get_image_path(record["sample_token"])
+            fig = _render_page(record, image_path)
+            pdf.savefig(fig, bbox_inches="tight", facecolor=fig.get_facecolor())
+            plt.close(fig)
+            if (i + 1) % 5 == 0:
+                print(f"  {i + 1}/{n} pages written")
+
+    print(f"\nSaved {n}-page PDF → {out_path}")
 
 
 if __name__ == "__main__":
