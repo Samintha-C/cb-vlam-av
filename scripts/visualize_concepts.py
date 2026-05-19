@@ -10,8 +10,13 @@ Usage:
         --out ./outputs/concepts.pdf
 """
 
-import argparse
+import sys
 from pathlib import Path
+
+# Ensure repo root is on sys.path regardless of how this script is invoked
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import argparse
 
 import matplotlib
 matplotlib.use("Agg")
