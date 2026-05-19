@@ -181,7 +181,13 @@ def main():
     if not set(passes).issubset(valid):
         raise ValueError(f"Invalid passes: {args.passes}. Must be subset of 'abc'.")
 
-    mine(
+    mine(=== Mining passes A + B + C (50 scenes, stride=4) ===
+usage: mine_concepts.py [-h] --data_root DATA_ROOT [--version VERSION]
+                        --output_path OUTPUT_PATH [--passes PASSES]
+                        [--max_scenes MAX_SCENES]
+                        [--vlm_backend {openrouter,anthropic,local}]
+                        [--vlm_model VLM_MODEL]
+mine_concepts.py: error: unrecognized arguments: --keyframe_stride 4
         data_root=Path(args.data_root),
         version=args.version,
         output_path=Path(args.output_path),
