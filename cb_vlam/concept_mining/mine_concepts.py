@@ -138,14 +138,29 @@ def mine(data_root: Path,
                                        keyframe_stride=keyframe_stride)
 
     all_records: List[Dict[str, Any]] = []
+    vlm_calls_total = 0
 
-    for scene_info in tqdm(loader.iter_scenes(max_scenes=max_scenes), desc="Scenes"):
+    scenes = list(loader.iter_scenes(max_scenes=max_scenes))
+    print(f"Mining {len(scenes)} scenes  |  passes={passes}  |  "
+          f"vlm={vlm_model if 'c' in passes else 'n/a'}  |  "
+          f"keyframe_stride={keyframe_stride if 'c' in passes else 'n/a'}")
+
+    for scene_idx, scene_info in enumerate(scenes):
+        print(f"\n[{scene_idx+1}/{len(scenes)}] {scene_info['scene_name']}  "
+              f"({scene_info['location']})", flush=True)
+
+        scene_ctx._vlm_call_count = 0
         records = mine_scene(
             loader, scene_info, kinematic, agent, infra, scene_ctx, passes
         )
         all_records.extend(records)
 
-    print(f"Total records: {len(all_records)}")
+        vlm_calls = getattr(scene_ctx, "_vlm_call_count", 0)
+        vlm_calls_total += vlm_calls
+        print(f"  → {len(records)} frames  |  VLM calls: {vlm_calls}  "
+              f"|  total so far: {vlm_calls_total}", flush=True)
+
+    print(f"\nTotal records: {len(all_records)}  |  Total VLM calls: {vlm_calls_total}")
 
     if not all_records:
         print("No records produced. Exiting.")

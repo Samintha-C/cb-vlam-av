@@ -28,8 +28,9 @@ PASS_B_AGENT_CONCEPTS: List[Dict] = [
     {"name": "nearest_pedestrian_distance", "type": "float", "desc": "Distance to nearest pedestrian (m), normalized [0, 1] over [0, 30]. 1.0 if none."},
     {"name": "vehicle_count_nearby", "type": "float", "desc": "Number of vehicles within 30m, normalized [0, 1] over [0, 10]"},
     {"name": "cyclist_present", "type": "binary", "desc": "1.0 if any cyclist is within 20m"},
-    {"name": "left_lane_blocked", "type": "binary", "desc": "1.0 if a vehicle occupies the left adjacent lane within 10m"},
-    {"name": "right_lane_blocked", "type": "binary", "desc": "1.0 if a vehicle occupies the right adjacent lane within 10m"},
+    {"name": "left_lane_blocked", "type": "binary", "desc": "1.0 if a moving vehicle (|v|>0.5 m/s) occupies the immediately adjacent left lane within ±20m"},
+    {"name": "right_lane_blocked", "type": "binary", "desc": "1.0 if a moving vehicle (|v|>0.5 m/s) occupies the immediately adjacent right lane within ±20m"},
+    {"name": "parked_cars_present", "type": "binary", "desc": "1.0 if any stationary vehicle (|v|<0.5 m/s) is in the side bands within ±15m"},
 ]
 
 PASS_B_INFRA_CONCEPTS: List[Dict] = [

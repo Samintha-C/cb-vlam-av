@@ -450,12 +450,22 @@ class SceneContextExtractor(BaseExtractor):
             return self._cached_labels.copy()
 
         try:
+            self._vlm_call_count = getattr(self, "_vlm_call_count", 0) + 1
+            print(f"  [pass-c] frame {frame_index:3d}  call #{self._vlm_call_count} ... ",
+                  end="", flush=True)
             raw = self._query_vlm(image)
             labels = self._raw_to_concepts(raw)
             self._cached_labels = labels
+            # Print a compact summary of notable non-default concepts
+            notable = {k: v for k, v in labels.items()
+                       if k in self._binary_names and v == 1.0}
+            notable.update({k: v for k, v in labels.items()
+                            if k in self._categorical_index and v != 0.0})
+            print("ok" + (f"  [{', '.join(f'{k}={v:.0f}' for k, v in notable.items())}]"
+                          if notable else ""), flush=True)
             return labels.copy()
         except Exception as e:
-            print(f"[pass-c] VLM call failed at frame {frame_index}: {e}")
+            print(f"FAILED: {e}", flush=True)
             return self._cached_labels.copy() if self._cached_labels else self._defaults()
 
     def _raw_to_concepts(self, raw: Dict[str, Any]) -> Dict[str, float]:
