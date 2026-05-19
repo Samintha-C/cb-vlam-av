@@ -111,7 +111,8 @@ def mine(data_root: Path,
          passes: List[str],
          max_scenes: Optional[int] = None,
          vlm_backend: str = "openrouter",
-         vlm_model: str = "google/gemini-2.5-flash") -> None:
+         vlm_model: str = "google/gemini-2.5-flash",
+         keyframe_stride: int = 1) -> None:
     """Main mining loop.
 
     Args:
@@ -133,7 +134,8 @@ def mine(data_root: Path,
     kinematic = KinematicExtractor()
     agent = AgentExtractor()
     infra = InfrastructureExtractor()
-    scene_ctx = SceneContextExtractor(backend=vlm_backend, model_name=vlm_model)
+    scene_ctx = SceneContextExtractor(backend=vlm_backend, model_name=vlm_model,
+                                       keyframe_stride=keyframe_stride)
 
     all_records: List[Dict[str, Any]] = []
 
@@ -170,6 +172,8 @@ def main():
     parser.add_argument("--vlm_backend", type=str, default="openrouter",
                         choices=["openrouter", "anthropic", "local"])
     parser.add_argument("--vlm_model", type=str, default="google/gemini-2.5-flash")
+    parser.add_argument("--keyframe_stride", type=int, default=1,
+                        help="Run VLM every N frames; labels carried forward between calls")
     args = parser.parse_args()
 
     passes = list(args.passes.lower())
@@ -185,6 +189,7 @@ def main():
         max_scenes=args.max_scenes,
         vlm_backend=args.vlm_backend,
         vlm_model=args.vlm_model,
+        keyframe_stride=args.keyframe_stride,
     )
 
 

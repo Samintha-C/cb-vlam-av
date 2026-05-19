@@ -122,14 +122,32 @@ def main():
     parser.add_argument("--dataset_path", required=True)
     parser.add_argument("--data_root",    required=True)
     parser.add_argument("--version",      default="v1.0-trainval")
-    parser.add_argument("--n_samples",    type=int, default=20,
-                        help="Number of samples to include in the PDF")
+    parser.add_argument("--n_samples",    type=int, default=50,
+                        help="Max number of pages in the PDF")
+    parser.add_argument("--sample_mode", type=str, default="one_per_scene",
+                        choices=["one_per_scene", "sequential"],
+                        help="one_per_scene: one mid-scene frame per scene; sequential: first N records")
     parser.add_argument("--out",          default="./outputs/concepts.pdf")
     args = parser.parse_args()
 
     ds = load_from_disk(args.dataset_path)
-    n = min(args.n_samples, len(ds))
-    print(f"Dataset: {len(ds)} records. Rendering {n} pages.")
+    print(f"Dataset: {len(ds)} records total.")
+
+    if args.sample_mode == "one_per_scene":
+        # One representative frame per scene: pick the middle frame of each scene.
+        from collections import defaultdict
+        scene_indices = defaultdict(list)
+        for i, r in enumerate(ds):
+            scene_indices[r["scene_token"]].append(i)
+        indices = []
+        for token, idxs in sorted(scene_indices.items()):
+            indices.append(idxs[len(idxs) // 2])
+        indices = indices[:args.n_samples]
+    else:
+        indices = list(range(min(args.n_samples, len(ds))))
+
+    n = len(indices)
+    print(f"Rendering {n} pages ({args.sample_mode}).")
 
     # Load nuScenes once for image path resolution
     try:
@@ -148,7 +166,7 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with PdfPages(out_path) as pdf:
-        for i in range(n):
+        for i in indices:
             record = ds[i]
             image_path = get_image_path(record["sample_token"])
             fig = _render_page(record, image_path)
