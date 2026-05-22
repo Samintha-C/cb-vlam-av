@@ -44,40 +44,40 @@ PASS_B_INFRA_CONCEPTS: List[Dict] = [
 ]
 
 PASS_C_SCENE_CONCEPTS: List[Dict] = [
-    # ─── Scene context (slow-changing, safe to carry forward) ───────────────
+    #scene context
     {"name": "weather",           "type": "categorical", "values": ["clear", "rain", "snow", "fog"],         "desc": "Weather condition"},
     {"name": "lighting",          "type": "categorical", "values": ["day", "dusk", "night"],                 "desc": "Lighting condition"},
     {"name": "traffic_density",   "type": "categorical", "values": ["light", "moderate", "heavy"],           "desc": "Density of nearby traffic"},
     {"name": "road_type",         "type": "categorical", "values": ["urban", "residential", "highway", "parking"], "desc": "Road type"},
 
-    # ─── Traffic infrastructure (signals & signs) ───────────────────────────
+    #traffic stuff/infrastructure
     {"name": "traffic_light_state", "type": "categorical", "values": ["none", "red", "yellow", "green"],     "desc": "Signal facing ego"},
     {"name": "stop_sign_visible",   "type": "binary",                                                         "desc": "Stop sign visible facing ego"},
     {"name": "speed_limit_sign",    "type": "categorical", "values": ["none", "20mph", "30mph", "40mph", "50mph", "65plus"], "desc": "Visible speed limit"},
     {"name": "construction_zone",   "type": "binary",                                                         "desc": "Cones/workers/orange signs present"},
     {"name": "school_zone",         "type": "binary",                                                         "desc": "School zone sign or school visible"},
 
-    # ─── Road surface ───────────────────────────────────────────────────────
+    #surface conditions
     {"name": "surface_wet",           "type": "binary", "desc": "Road surface wet or recently wet"},
     {"name": "surface_obscured",      "type": "binary", "desc": "Road obscured by snow/leaves/debris/glare"},
     {"name": "lane_markings_visible", "type": "binary", "desc": "Lane markings clearly visible"},
 
-    # ─── Visibility ─────────────────────────────────────────────────────────
+    #visibility
     {"name": "visibility_degraded",  "type": "binary", "desc": "Reduced visibility (fog/heavy rain/glare)"},
     {"name": "headlights_required",  "type": "binary", "desc": "Headlights should be on for current conditions"},
 
-    # ─── Agent behavior cues ────────────────────────────────────────────────
+    #behavior cues from other entities
     {"name": "lead_vehicle_brake_lights",  "type": "binary",                                                    "desc": "Brake lights illuminated on lead vehicle"},
     {"name": "lead_vehicle_turn_signal",   "type": "categorical", "values": ["none", "left", "right", "hazards"], "desc": "Turn signal state on lead vehicle"},
     {"name": "pedestrian_intent_crossing", "type": "binary",                                                    "desc": "Pedestrian intending to cross roadway"},
     {"name": "emergency_vehicle_present",  "type": "binary",                                                    "desc": "Police/ambulance/fire/tow with lights visible"},
 
-    # ─── Spatial / road geometry hints ──────────────────────────────────────
+    #nature of roads
     {"name": "road_narrows_ahead",      "type": "binary", "desc": "Road visibly narrows ahead"},
     {"name": "tunnel_or_bridge_ahead",  "type": "binary", "desc": "Tunnel or bridge ahead"},
     {"name": "hill_crest_ahead",        "type": "binary", "desc": "Hill crest hiding view ahead"},
 
-    # ─── Anomalies ──────────────────────────────────────────────────────────
+    #obstructions/misc
     {"name": "accident_or_disabled_vehicle", "type": "binary", "desc": "Accident or disabled vehicle visible"},
     {"name": "animal_or_debris_on_road",     "type": "binary", "desc": "Animal or debris on the road"},
 ]
