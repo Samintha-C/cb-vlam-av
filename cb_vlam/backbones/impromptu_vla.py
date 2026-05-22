@@ -73,6 +73,23 @@ class ImpromptuVLABackbone(BaseBackbone):
         print(f"  PLANNING tag tokenizes to {len(ids)} tokens: {ids}")
 
     @torch.inference_mode()
+    def generate(self, image: Image.Image, user_prompt: str, max_new_tokens: int = 150) -> str:
+        """Run autoregressive generation; return decoded new tokens only."""
+        text = user_prompt.replace("<image>", "").strip()
+        messages = [
+            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}
+        ]
+        prompt_text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.processor(
+            text=[prompt_text], images=[image], return_tensors="pt"
+        ).to(self.device)
+        output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        new_tokens = output_ids[0, inputs.input_ids.shape[1]:]
+        return self.processor.decode(new_tokens, skip_special_tokens=True)
+
+    @torch.inference_mode()
     def extract(self, image: Image.Image, user_prompt: str) -> Dict[str, np.ndarray]:
         # The training prompt contains an inline '<image>' placeholder. The
         # native Qwen2.5-VL chat template wants images as content entries,

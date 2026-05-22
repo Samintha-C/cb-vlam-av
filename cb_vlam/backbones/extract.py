@@ -134,6 +134,9 @@ def main():
                         help="For dev/testing: cap the records per split")
     parser.add_argument("--splits", default="train,test",
                         help="Comma-separated list of splits to process")
+    parser.add_argument("--generation_check", action="store_true",
+                        help="After extraction, run generate() on the first train sample "
+                             "to verify the model produces valid <PLANNING> trajectories.")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -165,6 +168,56 @@ def main():
         )
 
     print("\nAll splits done.")
+
+    if args.generation_check:
+        _run_generation_check(
+            backbone=backbone,
+            impromptu_repo=Path(args.impromptu_repo),
+            nuscenes_root=Path(args.nuscenes_root),
+        )
+
+
+def _run_generation_check(
+    backbone: ImpromptuVLABackbone,
+    impromptu_repo: Path,
+    nuscenes_root: Path,
+) -> None:
+    print("\n" + "=" * 60)
+    print("=== Generation sanity check ===")
+    print("=" * 60)
+
+    train_json = impromptu_repo / "nuscenes_train.json"
+    records = load_records(train_json)
+    rec = records[0]
+
+    sample_token = rec["id"]
+    image_rel = rec["images"][0]
+    image_path = nuscenes_root / image_rel
+    user_prompt = rec["messages"][0]["content"]
+
+    print(f"  sample_token : {sample_token}")
+    print(f"  image        : {image_rel}")
+    print(f"  prompt (truncated): {user_prompt[:120].strip()} ...")
+
+    try:
+        with Image.open(image_path) as im:
+            image = im.convert("RGB")
+        response = backbone.generate(image, user_prompt, max_new_tokens=150)
+    except Exception as e:
+        print(f"\n  [ERROR] generation failed: {type(e).__name__}: {e}")
+        return
+
+    print(f"\n  --- Generated response ---\n{response}\n  ---")
+
+    if "<PLANNING>" in response:
+        # Count coordinate pairs: expect sequences of (x y) numbers after <PLANNING>
+        import re
+        after = response.split("<PLANNING>", 1)[-1]
+        coords = re.findall(r"-?\d+\.?\d*\s+-?\d+\.?\d*", after)
+        print(f"\n  OK  <PLANNING> tag present")
+        print(f"  OK  {len(coords)} coordinate pair(s) found after <PLANNING>")
+    else:
+        print(f"\n  WARN  <PLANNING> tag NOT found — model may not be generating trajectories")
 
 
 if __name__ == "__main__":
