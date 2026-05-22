@@ -114,6 +114,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True,
                         help="Path to Impromptu-VLA checkpoint directory")
+    parser.add_argument("--processor_name", default=None,
+                        help="HF model name or path for the processor (defaults to --checkpoint). "
+                             "Use 'Qwen/Qwen2.5-VL-7B-Instruct' when the checkpoint's "
+                             "preprocessor_config.json is missing image_processor_type.")
     parser.add_argument("--nuscenes_root", required=True,
                         help="Root where the 'nuscenes/' directory lives (images resolve relative to here)")
     parser.add_argument("--impromptu_repo", required=True,
@@ -133,7 +137,9 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading backbone from {args.checkpoint} ...")
-    backbone = ImpromptuVLABackbone(args.checkpoint, dtype=args.dtype)
+    backbone = ImpromptuVLABackbone(
+        args.checkpoint, dtype=args.dtype, processor_path=args.processor_name
+    )
     backbone.load(device=args.device)
     print("Backbone loaded.")
 

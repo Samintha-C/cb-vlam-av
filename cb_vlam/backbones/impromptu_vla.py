@@ -29,9 +29,14 @@ from cb_vlam.backbones.base import BaseBackbone
 class ImpromptuVLABackbone(BaseBackbone):
     PLANNING_TAG = "<PLANNING>"
 
-    def __init__(self, checkpoint_path: str, dtype: str = "bf16"):
+    def __init__(self, checkpoint_path: str, dtype: str = "bf16",
+                 processor_path: str | None = None):
         self.checkpoint_path = Path(checkpoint_path)
         self.dtype_str = dtype
+        # LLaMA-Factory fine-tunes often omit image_processor_type in the
+        # checkpoint's preprocessor_config.json. Pass a base-model name or
+        # path to load the processor from a known-good source instead.
+        self.processor_path = processor_path or str(checkpoint_path)
         self.model = None
         self.processor = None
         self.device = None
@@ -56,7 +61,8 @@ class ImpromptuVLABackbone(BaseBackbone):
         )
         self.model.eval()
 
-        self.processor = AutoProcessor.from_pretrained(str(self.checkpoint_path))
+        print(f"  Loading processor from {self.processor_path} ...")
+        self.processor = AutoProcessor.from_pretrained(self.processor_path)
         self.device = device
 
         # Pre-tokenize the literal "<PLANNING>" string for teacher-forcing
