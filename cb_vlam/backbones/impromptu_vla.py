@@ -93,42 +93,36 @@ class ImpromptuVLABackbone(BaseBackbone):
             messages, tokenize=False, add_generation_prompt=True
         )
 
+        # Teacher-forcing: append <PLANNING> to the prompt string *before*
+        # calling the processor so it builds attention masks and RoPE
+        # positions over the complete sequence in one shot.
+        # Concatenating tensors manually after the fact leaves image_grid_thw
+        # stale, which causes Qwen2.5-VL's get_rope_index to raise an
+        # IndexError when the extended mask is larger than the rope tensor.
+        full_text = prompt_text + self.PLANNING_TAG
+
+        # Two processor calls: the first (CPU-only) measures where the prompt
+        # ends after image-token expansion; the second is the actual input.
+        prompt_len = self.processor(
+            text=[prompt_text], images=[image], return_tensors="pt"
+        ).input_ids.shape[1]
+
         inputs = self.processor(
-            text=[prompt_text],
-            images=[image],
-            return_tensors="pt",
+            text=[full_text], images=[image], return_tensors="pt"
         ).to(self.device)
 
-        # Length of the prompt sequence (before we append <PLANNING>)
-        prompt_len = inputs.input_ids.shape[1]
-
-        # Append <PLANNING> via teacher-forcing — one forward pass gives us
-        # both end-of-prompt and after-PLANNING hidden states.
-        planning_ids = self._planning_token_ids
-        n_planning = planning_ids.shape[1]
-
-        extended_ids = torch.cat([inputs.input_ids, planning_ids], dim=1)
-        extended_mask = torch.cat(
-            [inputs.attention_mask, torch.ones_like(planning_ids)], dim=1
-        )
-
-        forward_kwargs = dict(inputs)
-        forward_kwargs["input_ids"] = extended_ids
-        forward_kwargs["attention_mask"] = extended_mask
+        total_len = inputs.input_ids.shape[1]
+        endprompt_pos = prompt_len - 1   # last token before <PLANNING>
+        afterplan_pos = total_len - 1    # last <PLANNING> token
 
         outputs = self.model(
-            **forward_kwargs,
+            **inputs,
             output_hidden_states=True,
             return_dict=True,
         )
         # outputs.hidden_states: tuple of (n_layers + 1) tensors, each (B, T, D)
         last_layer = outputs.hidden_states[-1][0]      # (T, D)
         penult_layer = outputs.hidden_states[-2][0]    # (T, D)
-
-        # Position prompt_len-1 = last token of the prompt (before PLANNING)
-        # Position prompt_len+n_planning-1 = last PLANNING token
-        endprompt_pos = prompt_len - 1
-        afterplan_pos = prompt_len + n_planning - 1
 
         return {
             "feat_endprompt_final":  last_layer[endprompt_pos].float().cpu().numpy(),
