@@ -210,12 +210,12 @@ def _run_generation_check(
     print(f"\n  --- Generated response ---\n{response}\n  ---")
 
     if "<PLANNING>" in response:
-        # Count coordinate pairs: expect sequences of (x y) numbers after <PLANNING>
+        # The model outputs waypoints as [x, y] pairs inside <PLANNING>...</PLANNING>
         import re
         after = response.split("<PLANNING>", 1)[-1]
-        coords = re.findall(r"-?\d+\.?\d*\s+-?\d+\.?\d*", after)
+        coords = re.findall(r"\[(-?\d+\.?\d*),\s*(-?\d+\.?\d*)\]", after)
         print(f"\n  OK  <PLANNING> tag present")
-        print(f"  OK  {len(coords)} coordinate pair(s) found after <PLANNING>")
+        print(f"  OK  {len(coords)} waypoint(s) found: {coords[:3]}{'...' if len(coords) > 3 else ''}")
     else:
         print(f"\n  WARN  <PLANNING> tag NOT found — model may not be generating trajectories")
 
