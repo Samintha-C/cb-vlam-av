@@ -106,6 +106,9 @@ def process_split(
         Dataset.from_list(rows).save_to_disk(str(shard_path))
         tqdm.write(f"  saved {shard_path.name} ({len(rows)} rows)")
 
+    if failures == n:
+        print(f"=== {split_name}: ALL {n} samples failed — not writing .all_done sentinel ===")
+        return
     done_sentinel.touch()
     print(f"=== {split_name}: done. failures: {failures}/{n} ===")
 
