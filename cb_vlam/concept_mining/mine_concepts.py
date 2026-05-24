@@ -5,8 +5,9 @@ the resulting per-frame concept records as a HuggingFace Dataset.
 """
 
 import argparse
+import json
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 
 import numpy as np
 from tqdm import tqdm
@@ -22,13 +23,34 @@ from cb_vlam.concept_mining.schema import default_concept_dict, CONCEPT_KEYS
 from cb_vlam.data.nuscenes_loader import NuScenesLoader
 
 
+def _load_sample_token_filter(path: Path) -> Set[str]:
+    """Load a sample-token allow-list from JSON.
+
+    Accepts two formats:
+      - ["token1", "token2", ...]  (bare list of sample_tokens)
+      - [{"id": "token1", ...}, ...]  (Impromptu-VLA records, keyed by 'id')
+    """
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, list) or not data:
+        raise ValueError(f"{path}: expected a non-empty JSON list")
+    if isinstance(data[0], str):
+        return set(data)
+    if isinstance(data[0], dict) and "id" in data[0]:
+        return {rec["id"] for rec in data}
+    raise ValueError(
+        f"{path}: list elements must be strings or dicts with 'id' field"
+    )
+
+
 def mine_scene(loader: NuScenesLoader,
                scene_info: Dict[str, Any],
                kinematic: KinematicExtractor,
                agent: AgentExtractor,
                infra: InfrastructureExtractor,
                scene_ctx: SceneContextExtractor,
-               passes: List[str]) -> List[Dict[str, Any]]:
+               passes: List[str],
+               sample_token_filter: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
     """Run concept extraction over all samples in one scene.
 
     Args:
@@ -50,6 +72,13 @@ def mine_scene(loader: NuScenesLoader,
     prev_sample: Optional[Dict[str, Any]] = None
 
     for frame_index, sample in enumerate(loader.iter_samples(scene_info["scene_token"])):
+        # Note: prev_sample is still advanced even for skipped frames so that
+        # kinematic/agent deltas remain correct when we DO emit a record.
+        if (sample_token_filter is not None
+                and sample["sample_token"] not in sample_token_filter):
+            prev_sample = sample
+            continue
+
         concepts = default_concept_dict()
 
         if "a" in passes:
@@ -112,7 +141,8 @@ def mine(data_root: Path,
          max_scenes: Optional[int] = None,
          vlm_backend: str = "openrouter",
          vlm_model: str = "google/gemini-2.5-flash",
-         keyframe_stride: int = 1) -> None:
+         keyframe_stride: int = 1,
+         sample_tokens_file: Optional[Path] = None) -> None:
     """Main mining loop.
 
     Args:
@@ -124,11 +154,17 @@ def mine(data_root: Path,
         vlm_backend: "anthropic" or "local" (only used if Pass C is enabled).
         vlm_model: VLM model name.
     """
+    sample_token_filter: Optional[Set[str]] = None
+    if sample_tokens_file is not None:
+        sample_token_filter = _load_sample_token_filter(sample_tokens_file)
+        print(f"Loaded sample-token filter: {len(sample_token_filter)} tokens "
+              f"from {sample_tokens_file}")
+
     loader = NuScenesLoader(
         data_root=data_root,
         version=version,
         load_images="c" in passes,
-        load_maps=False,  # enable once InfrastructureExtractor is implemented
+        load_maps="b" in passes,
     )
 
     kinematic = KinematicExtractor()
@@ -151,7 +187,8 @@ def mine(data_root: Path,
 
         scene_ctx._vlm_call_count = 0
         records = mine_scene(
-            loader, scene_info, kinematic, agent, infra, scene_ctx, passes
+            loader, scene_info, kinematic, agent, infra, scene_ctx, passes,
+            sample_token_filter=sample_token_filter,
         )
         all_records.extend(records)
 
@@ -185,10 +222,14 @@ def main():
     parser.add_argument("--max_scenes", type=int, default=None,
                         help="Limit number of scenes (for development)")
     parser.add_argument("--vlm_backend", type=str, default="openrouter",
-                        choices=["openrouter", "anthropic", "local"])
+                        choices=["openrouter", "nrp"])
     parser.add_argument("--vlm_model", type=str, default="google/gemini-2.5-flash")
     parser.add_argument("--keyframe_stride", type=int, default=1,
                         help="Run VLM every N frames; labels carried forward between calls")
+    parser.add_argument("--sample_tokens_file", type=str, default=None,
+                        help="JSON file restricting mining to specific sample_tokens. "
+                             "Accepts either a bare list of tokens or Impromptu-VLA "
+                             "records (list of dicts with 'id' field).")
     args = parser.parse_args()
 
     passes = list(args.passes.lower())
@@ -205,6 +246,7 @@ def main():
         vlm_backend=args.vlm_backend,
         vlm_model=args.vlm_model,
         keyframe_stride=args.keyframe_stride,
+        sample_tokens_file=Path(args.sample_tokens_file) if args.sample_tokens_file else None,
     )
 
 

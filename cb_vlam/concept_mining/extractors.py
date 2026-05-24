@@ -289,15 +289,33 @@ class AgentExtractor(BaseExtractor):
         nearby_count = sum(1 for v in vehicles if v["dist"] < self.nearby_vehicle_range_m)
         cyc_close    = any(c["dist"] < self.pedestrian_check_range_m for c in cyclists)
 
-        # Adjacent lane occupancy: check vehicles in the lateral band of the next lane
+        # Per-vehicle planar speed via instance tracking — needed for moving/parked checks
+        def _vehicle_speed(v) -> float:
+            inst = v["ann"]["instance_token"]
+            if inst not in prev_by_inst:
+                return 0.0
+            delta = (np.array(v["ann"]["translation"][:2])
+                     - np.array(prev_by_inst[inst]["translation"][:2]))
+            return float(np.linalg.norm(delta) / dt)
+
+        # Adjacent lane occupancy: only count vehicles that are actually moving
         L = self.lane_width_m
         left_blocked  = any(
-            v for v in vehicles
+            _vehicle_speed(v) > 0.5
+            for v in vehicles
             if L * 0.5 < v["pos"][1] < L * 2.5 and abs(v["pos"][0]) < 10.0
         )
         right_blocked = any(
-            v for v in vehicles
+            _vehicle_speed(v) > 0.5
+            for v in vehicles
             if -L * 2.5 < v["pos"][1] < -L * 0.5 and abs(v["pos"][0]) < 10.0
+        )
+
+        # Parked cars: stationary vehicles in side bands within ±15m along x
+        parked = any(
+            _vehicle_speed(v) < 0.5
+            for v in vehicles
+            if abs(v["pos"][1]) > L * 0.5 and abs(v["pos"][0]) < 15.0
         )
 
         out_misc = {
@@ -305,6 +323,7 @@ class AgentExtractor(BaseExtractor):
             "cyclist_present":       1.0 if cyc_close else 0.0,
             "left_lane_blocked":     1.0 if left_blocked  else 0.0,
             "right_lane_blocked":    1.0 if right_blocked else 0.0,
+            "parked_cars_present":   1.0 if parked        else 0.0,
         }
 
         # ── Update state ──────────────────────────────────────────────────────
@@ -318,41 +337,177 @@ class AgentExtractor(BaseExtractor):
 
 
 class InfrastructureExtractor(BaseExtractor):
-    """Pass B (infrastructure): extract concepts from HD map.
+    """Pass B (infrastructure): extract concepts from the HD map.
 
-    Uses nuScenes' NuScenesMap API to query:
-    - Current lane and lane geometry
-    - Distance to next intersection
-    - Lane availability (left/right lanes exist)
-    - Road curvature ahead
+    Uses NuScenesMap to query:
+    - Whether ego is inside an intersection polygon
+    - Distance to the next intersection along the forward direction
+    - Whether adjacent left/right lanes exist on the current road
+    - Curvature of the lane centerline `lookahead_m` ahead
 
-    Speed limit is not directly available in nuScenes maps; either omit it
-    for now or infer it from road type (highway vs urban).
+    `speed_limit_normalized` is always 0.0: nuScenes HD maps do not encode
+    speed limits. The Pass C VLM produces `speed_limit_sign` separately and
+    can supply a noisy version of this signal.
     """
 
     def __init__(self,
                  lookahead_m: float = 30.0,
-                 max_intersection_distance_m: float = 100.0):
+                 max_intersection_distance_m: float = 100.0,
+                 lane_search_radius_m: float = 2.0,
+                 lane_width_m: float = 3.5,
+                 max_curvature_per_m: float = 0.05):
         super().__init__()
         self.lookahead_m = lookahead_m
         self.max_intersection_distance_m = max_intersection_distance_m
+        self.lane_search_radius_m = lane_search_radius_m
+        self.lane_width_m = lane_width_m
+        self.max_curvature_per_m = max_curvature_per_m
+
+    @staticmethod
+    def _menger_curvature_signed(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray) -> float:
+        """Signed Menger curvature of 3 points. Positive = left turn."""
+        a = np.linalg.norm(p1 - p0)
+        b = np.linalg.norm(p2 - p1)
+        c = np.linalg.norm(p2 - p0)
+        if a * b * c < 1e-6:
+            return 0.0
+        # Signed twice-area via 2D cross product
+        cross = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])
+        return float(2.0 * cross / (a * b * c))
 
     def extract(self,
                 ego_pose: Dict[str, Any],
                 nusc_map: Any) -> Dict[str, float]:
-        """Extract infrastructure concepts for one frame.
+        """Extract infrastructure concepts for one frame."""
+        from nuscenes.map_expansion import arcline_path_utils
 
-        Args:
-            ego_pose: Ego pose record.
-            nusc_map: NuScenesMap instance for the current scene's location.
+        x, y = float(ego_pose["translation"][0]), float(ego_pose["translation"][1])
+        yaw = _yaw_from_quaternion_wxyz(ego_pose["rotation"])
+        forward = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float64)
 
-        Returns:
-            Dict with keys matching PASS_B_INFRA_CONCEPTS schema.
-        """
-        raise NotImplementedError
+        # ── in_intersection ───────────────────────────────────────────────────
+        in_intersection = 0.0
+        layers = nusc_map.layers_on_point(x, y)
+        rs_token = layers.get("road_segment", "")
+        if rs_token:
+            rs = nusc_map.get("road_segment", rs_token)
+            if rs.get("is_intersection", False):
+                in_intersection = 1.0
+
+        # ── distance_to_intersection ──────────────────────────────────────────
+        # Search nearby road_segments and walkways for the closest intersection
+        # whose centroid lies in the forward half-plane (forward · rel > 0).
+        nearby = nusc_map.get_records_in_radius(
+            x, y, self.max_intersection_distance_m, ["road_segment"]
+        )["road_segment"]
+        min_fwd_dist = float("inf")
+        for tok in nearby:
+            rs = nusc_map.get("road_segment", tok)
+            if not rs.get("is_intersection", False):
+                continue
+            try:
+                poly = nusc_map.extract_polygon(rs["polygon_token"])
+                cx, cy = poly.centroid.x, poly.centroid.y
+            except Exception:
+                continue
+            rel = np.array([cx - x, cy - y])
+            d = float(np.linalg.norm(rel))
+            if d < 1e-3:
+                continue
+            if float(rel @ forward) <= 0:
+                continue
+            if d < min_fwd_dist:
+                min_fwd_dist = d
+
+        if in_intersection:
+            dist_norm = 0.0
+            approaching = 1.0
+        elif min_fwd_dist == float("inf"):
+            dist_norm = 1.0
+            approaching = 0.0
+        else:
+            dist_norm = float(min(min_fwd_dist / self.max_intersection_distance_m, 1.0))
+            approaching = 1.0 if min_fwd_dist < 30.0 else 0.0
+
+        # ── lane availability + curvature ─────────────────────────────────────
+        lane_left = 0.0
+        lane_right = 0.0
+        curvature_norm = 0.0
+
+        current_lane_token = nusc_map.get_closest_lane(x, y, radius=self.lane_search_radius_m)
+        if current_lane_token:
+            arcline = nusc_map.arcline_path_3.get(current_lane_token)
+            if arcline:
+                poses = arcline_path_utils.discretize_lane(arcline, resolution_meters=1.0)
+                if poses:
+                    lane_xy = np.array([(p[0], p[1]) for p in poses])
+                    d_to_lane = np.linalg.norm(lane_xy - np.array([x, y]), axis=1)
+                    nearest_idx = int(np.argmin(d_to_lane))
+                    target_idx = min(nearest_idx + int(self.lookahead_m),
+                                     len(poses) - 1)
+                    if target_idx - nearest_idx >= 2:
+                        mid_idx = (nearest_idx + target_idx) // 2
+                        curv = self._menger_curvature_signed(
+                            lane_xy[nearest_idx],
+                            lane_xy[mid_idx],
+                            lane_xy[target_idx],
+                        )
+                        curvature_norm = float(np.clip(
+                            curv / self.max_curvature_per_m, -1.0, 1.0))
+
+                    lane_yaw = float(poses[nearest_idx][2])
+                    # Perpendicular: left is +90° from heading
+                    perp_left = np.array([-np.sin(lane_yaw), np.cos(lane_yaw)])
+                    probe_left = np.array([x, y]) + perp_left * self.lane_width_m
+                    probe_right = np.array([x, y]) - perp_left * self.lane_width_m
+
+                    left_tok = nusc_map.get_closest_lane(
+                        float(probe_left[0]), float(probe_left[1]),
+                        radius=self.lane_search_radius_m,
+                    )
+                    right_tok = nusc_map.get_closest_lane(
+                        float(probe_right[0]), float(probe_right[1]),
+                        radius=self.lane_search_radius_m,
+                    )
+                    if left_tok and left_tok != current_lane_token:
+                        lane_left = 1.0
+                    if right_tok and right_tok != current_lane_token:
+                        lane_right = 1.0
+
+        return {
+            "approaching_intersection": float(approaching),
+            "distance_to_intersection": dist_norm,
+            "lane_available_left":      lane_left,
+            "lane_available_right":     lane_right,
+            # nuScenes maps have no speed-limit field; left at 0.0 (Pass C
+            # `speed_limit_sign` covers this from the front-camera image).
+            "speed_limit_normalized":   0.0,
+            "road_curvature_ahead":     curvature_norm,
+            "in_intersection":          in_intersection,
+        }
 
 
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_NRP_URL = "https://ellm.nrp-nautilus.io/v1/chat/completions"
+
+# Both backends are OpenAI-compatible — they differ only in endpoint URL,
+# the env var that holds the bearer token, and (for OpenRouter) two attribution
+# headers. Keeping the table here makes adding a third backend trivial.
+_BACKEND_CONFIG = {
+    "openrouter": {
+        "url": _OPENROUTER_URL,
+        "env_var": "OPENROUTER_API_KEY",
+        "extra_headers": {
+            "HTTP-Referer": "https://github.com/Samintha-C/cb-vlam-av",
+            "X-Title": "cb-vlam-av",
+        },
+    },
+    "nrp": {
+        "url": _NRP_URL,
+        "env_var": "NRP_API_KEY",
+        "extra_headers": {},
+    },
+}
 
 
 def _build_pass_c_prompt() -> str:
@@ -486,7 +641,7 @@ class SceneContextExtractor(BaseExtractor):
         return out
 
     def _query_vlm(self, image: np.ndarray) -> Dict[str, Any]:
-        """Send image to VLM via OpenRouter; return the parsed JSON dict."""
+        """Send image to VLM via the configured OpenAI-compatible backend."""
         import base64
         import json
         import os
@@ -496,12 +651,16 @@ class SceneContextExtractor(BaseExtractor):
         import requests
         from PIL import Image
 
-        if self.backend != "openrouter":
-            raise NotImplementedError(f"Backend {self.backend!r} not implemented")
+        if self.backend not in _BACKEND_CONFIG:
+            raise NotImplementedError(
+                f"Backend {self.backend!r} not implemented. "
+                f"Available: {sorted(_BACKEND_CONFIG)}"
+            )
+        cfg = _BACKEND_CONFIG[self.backend]
 
-        api_key = os.environ.get("OPENROUTER_API_KEY")
+        api_key = os.environ.get(cfg["env_var"])
         if not api_key:
-            raise RuntimeError("OPENROUTER_API_KEY env var not set")
+            raise RuntimeError(f"{cfg['env_var']} env var not set")
 
         # Resize + JPEG-encode to keep image tokens manageable
         pil = Image.fromarray(image)
@@ -525,15 +684,14 @@ class SceneContextExtractor(BaseExtractor):
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type":  "application/json",
-            "HTTP-Referer":  "https://github.com/Samintha-C/cb-vlam-av",
-            "X-Title":       "cb-vlam-av",
+            **cfg["extra_headers"],
         }
 
         # Up to 3 attempts with exponential backoff for rate-limit / transient errors
         last_err = None
         for attempt in range(3):
             try:
-                r = requests.post(_OPENROUTER_URL, headers=headers, json=payload,
+                r = requests.post(cfg["url"], headers=headers, json=payload,
                                   timeout=self.request_timeout)
                 if r.status_code == 429 or r.status_code >= 500:
                     last_err = f"HTTP {r.status_code}: {r.text[:200]}"
