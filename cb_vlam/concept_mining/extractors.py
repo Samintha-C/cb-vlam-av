@@ -555,7 +555,7 @@ class SceneContextExtractor(BaseExtractor):
                  keyframe_stride: int = 1,
                  max_image_dim: int = 1024,
                  jpeg_quality: int = 85,
-                 request_timeout: int = 60):
+                 request_timeout: int = 180):
         super().__init__()
         self.backend = backend
         self.model_name = model_name
@@ -687,7 +687,9 @@ class SceneContextExtractor(BaseExtractor):
             **cfg["extra_headers"],
         }
 
-        # Up to 3 attempts with exponential backoff for rate-limit / transient errors
+        # Up to 3 attempts with exponential backoff for rate-limit / transient errors.
+        # 4xx errors (other than 429) are fatal and surface immediately — they
+        # indicate a malformed payload that retrying won't fix.
         last_err = None
         for attempt in range(3):
             try:
@@ -697,13 +699,19 @@ class SceneContextExtractor(BaseExtractor):
                     last_err = f"HTTP {r.status_code}: {r.text[:200]}"
                     time.sleep(2 ** attempt)
                     continue
+                if 400 <= r.status_code < 500:
+                    raise RuntimeError(
+                        f"VLM rejected request (HTTP {r.status_code}): {r.text[:500]}"
+                    )
                 r.raise_for_status()
                 content = r.json()["choices"][0]["message"]["content"]
                 # Strip stray markdown fences if present
                 content = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                 return json.loads(content)
+            except RuntimeError:
+                raise
             except Exception as e:
-                last_err = str(e)
+                last_err = f"{type(e).__name__}: {e}"
                 if attempt < 2:
                     time.sleep(2 ** attempt)
         raise RuntimeError(f"VLM query failed after 3 attempts: {last_err}")
