@@ -50,7 +50,8 @@ def mine_scene(loader: NuScenesLoader,
                infra: InfrastructureExtractor,
                scene_ctx: SceneContextExtractor,
                passes: List[str],
-               sample_token_filter: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
+               sample_token_filter: Optional[Set[str]] = None,
+               vlm_workers: int = 1) -> List[Dict[str, Any]]:
     """Run concept extraction over all samples in one scene.
 
     Args:
@@ -68,10 +69,18 @@ def mine_scene(loader: NuScenesLoader,
     infra.reset()
     scene_ctx.reset()
 
+    # Buffer all samples so Pass C can fire VLM calls concurrently before the
+    # main per-frame loop (which must stay sequential for kinematic/agent deltas).
+    all_samples = list(enumerate(loader.iter_samples(scene_info["scene_token"])))
+
+    if "c" in passes and vlm_workers > 1:
+        indexed_images = [(idx, s["front_image"]) for idx, s in all_samples]
+        scene_ctx.precompute_scene(indexed_images, max_workers=vlm_workers)
+
     records: List[Dict[str, Any]] = []
     prev_sample: Optional[Dict[str, Any]] = None
 
-    for frame_index, sample in enumerate(loader.iter_samples(scene_info["scene_token"])):
+    for frame_index, sample in all_samples:
         # Note: prev_sample is still advanced even for skipped frames so that
         # kinematic/agent deltas remain correct when we DO emit a record.
         if (sample_token_filter is not None
@@ -142,7 +151,8 @@ def mine(data_root: Path,
          vlm_backend: str = "openrouter",
          vlm_model: str = "google/gemini-2.5-flash",
          keyframe_stride: int = 1,
-         sample_tokens_file: Optional[Path] = None) -> None:
+         sample_tokens_file: Optional[Path] = None,
+         vlm_workers: int = 1) -> None:
     """Main mining loop.
 
     Args:
@@ -189,6 +199,7 @@ def mine(data_root: Path,
         records = mine_scene(
             loader, scene_info, kinematic, agent, infra, scene_ctx, passes,
             sample_token_filter=sample_token_filter,
+            vlm_workers=vlm_workers,
         )
         all_records.extend(records)
 
@@ -226,6 +237,9 @@ def main():
     parser.add_argument("--vlm_model", type=str, default="google/gemini-2.5-flash")
     parser.add_argument("--keyframe_stride", type=int, default=1,
                         help="Run VLM every N frames; labels carried forward between calls")
+    parser.add_argument("--vlm_workers", type=int, default=1,
+                        help="Concurrent VLM calls per scene. Use 8 for qwen3-small, "
+                             "16 for qwen3 (NRP fair-use limits).")
     parser.add_argument("--sample_tokens_file", type=str, default=None,
                         help="JSON file restricting mining to specific sample_tokens. "
                              "Accepts either a bare list of tokens or Impromptu-VLA "
@@ -247,6 +261,7 @@ def main():
         vlm_model=args.vlm_model,
         keyframe_stride=args.keyframe_stride,
         sample_tokens_file=Path(args.sample_tokens_file) if args.sample_tokens_file else None,
+        vlm_workers=args.vlm_workers,
     )
 
 

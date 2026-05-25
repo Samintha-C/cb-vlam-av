@@ -579,6 +579,80 @@ class SceneContextExtractor(BaseExtractor):
     def reset(self) -> None:
         super().reset()
         self._cached_labels = None
+        self._precomputed: Dict[int, Dict[str, float]] = {}
+
+    def precompute_scene(
+        self,
+        indexed_images: List[tuple],
+        max_workers: int = 1,
+    ) -> None:
+        """Fire VLM calls for all stride-sampled frames concurrently.
+
+        Args:
+            indexed_images: List of (frame_index, image_ndarray) for every
+                frame in the scene, in scene order.
+            max_workers: Number of concurrent HTTP requests.  Should not
+                exceed the per-model concurrency limit on the gateway
+                (8 for qwen3-small, 16 for qwen3).
+
+        After this returns, `extract()` reads from `self._precomputed`
+        instead of making synchronous calls.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
+        self._precomputed = {}
+        vlm_frames = [
+            (idx, img) for idx, img in indexed_images
+            if img is not None and idx % self.keyframe_stride == 0
+        ]
+        if not vlm_frames:
+            return
+
+        call_counter = [0]
+        counter_lock = threading.Lock()
+        results: Dict[int, Optional[Dict[str, float]]] = {}
+
+        def _call_one(frame_idx, image):
+            try:
+                raw = self._query_vlm(image)
+                return frame_idx, self._raw_to_concepts(raw)
+            except Exception as e:
+                return frame_idx, None  # carry-forward will fill this
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_idx = {pool.submit(_call_one, idx, img): idx
+                             for idx, img in vlm_frames}
+            for future in as_completed(future_to_idx):
+                frame_idx, concepts = future.result()
+                results[frame_idx] = concepts
+                with counter_lock:
+                    call_counter[0] += 1
+                    n = call_counter[0]
+                status = "ok" if concepts is not None else "FAILED"
+                if concepts:
+                    notable = {k: v for k, v in concepts.items()
+                               if k in self._binary_names and v == 1.0}
+                    notable.update({k: v for k, v in concepts.items()
+                                    if k in self._categorical_index and v != 0.0})
+                    suffix = (f"  [{', '.join(f'{k}={v:.0f}' for k, v in notable.items())}]"
+                              if notable else "")
+                else:
+                    suffix = ""
+                print(f"  [pass-c] frame {frame_idx:3d}  call #{n}/{len(vlm_frames)} ... "
+                      f"{status}{suffix}", flush=True)
+
+        # Apply carry-forward in frame order to fill self._precomputed
+        cached = None
+        for idx, _ in sorted(indexed_images, key=lambda x: x[0]):
+            if idx in results:
+                if results[idx] is not None:
+                    cached = results[idx]
+                self._precomputed[idx] = cached.copy() if cached else self._defaults()
+            else:
+                self._precomputed[idx] = cached.copy() if cached else self._defaults()
+
+        self._vlm_call_count = getattr(self, "_vlm_call_count", 0) + len(vlm_frames)
 
     def _defaults(self) -> Dict[str, float]:
         """All-zero / first-category default values for every Pass C concept."""
@@ -597,6 +671,10 @@ class SceneContextExtractor(BaseExtractor):
         Returns:
             Dict with keys matching PASS_C_SCENE_CONCEPTS schema.
         """
+        # Fast path: precompute_scene already ran for this scene.
+        if frame_index in self._precomputed:
+            return self._precomputed[frame_index].copy()
+
         if image is None:
             return self._cached_labels.copy() if self._cached_labels else self._defaults()
 
