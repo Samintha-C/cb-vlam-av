@@ -155,18 +155,9 @@ def mine(data_root: Path,
          keyframe_stride: int = 1,
          sample_tokens_file: Optional[Path] = None,
          vlm_workers: int = 1,
-         vlm_image_dim: int = 1024) -> None:
-    """Main mining loop.
-
-    Args:
-        data_root: Path to nuScenes data root.
-        version: nuScenes version (e.g., "v1.0-mini").
-        output_path: Where to save the resulting HuggingFace Dataset.
-        passes: Which passes to run.
-        max_scenes: Optional scene limit for development.
-        vlm_backend: "anthropic" or "local" (only used if Pass C is enabled).
-        vlm_model: VLM model name.
-    """
+         vlm_image_dim: int = 1024,
+         vlm_verbose: bool = False) -> None:
+    """Main mining loop."""
     sample_token_filter: Optional[Set[str]] = None
     if sample_tokens_file is not None:
         sample_token_filter = _load_sample_token_filter(sample_tokens_file)
@@ -185,7 +176,8 @@ def mine(data_root: Path,
     infra = InfrastructureExtractor()
     scene_ctx = SceneContextExtractor(backend=vlm_backend, model_name=vlm_model,
                                        keyframe_stride=keyframe_stride,
-                                       max_image_dim=vlm_image_dim)
+                                       max_image_dim=vlm_image_dim,
+                                       verbose=vlm_verbose)
 
     all_records: List[Dict[str, Any]] = []
     vlm_calls_total = 0
@@ -252,6 +244,9 @@ def main():
                         help="JSON file restricting mining to specific sample_tokens. "
                              "Accepts either a bare list of tokens or Impromptu-VLA "
                              "records (list of dicts with 'id' field).")
+    parser.add_argument("--vlm_verbose", action="store_true",
+                        help="Print raw VLM response and CoT trace (reasoning_content) "
+                             "for every call. Useful for diagnosing concept misfires.")
     args = parser.parse_args()
 
     passes = list(args.passes.lower())
@@ -271,6 +266,7 @@ def main():
         sample_tokens_file=Path(args.sample_tokens_file) if args.sample_tokens_file else None,
         vlm_workers=args.vlm_workers,
         vlm_image_dim=args.vlm_image_dim,
+        vlm_verbose=args.vlm_verbose,
     )
 
 

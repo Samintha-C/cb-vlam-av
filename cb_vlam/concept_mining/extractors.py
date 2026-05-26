@@ -606,7 +606,8 @@ class SceneContextExtractor(BaseExtractor):
                  keyframe_stride: int = 1,
                  max_image_dim: int = 1024,
                  jpeg_quality: int = 85,
-                 request_timeout: int = 180):
+                 request_timeout: int = 180,
+                 verbose: bool = False):
         super().__init__()
         self.backend = backend
         self.model_name = model_name
@@ -614,6 +615,7 @@ class SceneContextExtractor(BaseExtractor):
         self.max_image_dim = max_image_dim
         self.jpeg_quality = jpeg_quality
         self.request_timeout = request_timeout
+        self.verbose = verbose
         self._cached_labels: Optional[Dict[str, float]] = None
         self._prompt = _build_pass_c_prompt()
 
@@ -880,7 +882,13 @@ class SceneContextExtractor(BaseExtractor):
                         f"VLM rejected request (HTTP {r.status_code}): {r.text[:500]}"
                     )
                 r.raise_for_status()
-                content = r.json()["choices"][0]["message"]["content"]
+                msg = r.json()["choices"][0]["message"]
+                reasoning = msg.get("reasoning_content", "")
+                content = msg["content"]
+                if self.verbose:
+                    if reasoning:
+                        print(f"\n  [vlm-cot]\n{reasoning}\n  [/vlm-cot]", flush=True)
+                    print(f"  [vlm-raw] {content!r}", flush=True)
                 # Strip stray markdown fences if present
                 content = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                 return json.loads(content)
