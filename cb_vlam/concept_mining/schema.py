@@ -24,7 +24,7 @@ PASS_B_AGENT_CONCEPTS: List[Dict] = [
     {"name": "lead_vehicle_distance", "type": "float", "desc": "Distance to lead vehicle (m), normalized [0, 1] over [0, 50]. 1.0 if no lead vehicle."},
     {"name": "lead_vehicle_relative_velocity", "type": "float", "desc": "Closing rate (m/s, positive = approaching), normalized [-1, 1] over [-10, 10]"},
     {"name": "lead_vehicle_decelerating", "type": "binary", "desc": "1.0 if lead vehicle's acceleration < -1 m/s^2"},
-    {"name": "pedestrian_in_crosswalk_ahead", "type": "binary", "desc": "1.0 if any pedestrian is in a crosswalk within 20m ahead of ego"},
+    {"name": "pedestrian_ahead", "type": "binary", "desc": "1.0 if any pedestrian is within 10m ahead of ego in the forward corridor (±4m lateral)"},
     {"name": "nearest_pedestrian_distance", "type": "float", "desc": "Distance to nearest pedestrian (m), normalized [0, 1] over [0, 30]. 1.0 if none."},
     {"name": "vehicle_count_nearby", "type": "float", "desc": "Number of vehicles within 30m, normalized [0, 1] over [0, 10]"},
     {"name": "cyclist_present", "type": "binary", "desc": "1.0 if any cyclist is within 20m"},

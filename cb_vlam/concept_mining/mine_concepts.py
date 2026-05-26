@@ -73,9 +73,11 @@ def mine_scene(loader: NuScenesLoader,
     # main per-frame loop (which must stay sequential for kinematic/agent deltas).
     all_samples = list(enumerate(loader.iter_samples(scene_info["scene_token"])))
 
-    if "c" in passes and vlm_workers > 1:
-        indexed_images = [(idx, s["front_image"]) for idx, s in all_samples]
-        scene_ctx.precompute_scene(indexed_images, max_workers=vlm_workers)
+    if "c" in passes:
+        scene_ctx.set_scene_context(scene_info.get("location", ""))
+        if vlm_workers > 1:
+            indexed_images = [(idx, s["front_image"]) for idx, s in all_samples]
+            scene_ctx.precompute_scene(indexed_images, max_workers=vlm_workers)
 
     records: List[Dict[str, Any]] = []
     prev_sample: Optional[Dict[str, Any]] = None

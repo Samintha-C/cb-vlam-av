@@ -271,8 +271,7 @@ class AgentExtractor(BaseExtractor):
             }
 
         # ── Pedestrians ───────────────────────────────────────────────────────
-        # pedestrian_in_crosswalk_ahead: without HD map we approximate as any
-        # pedestrian within 10 m ahead in the forward corridor (±4 m lateral).
+        # pedestrian_ahead: any pedestrian within 10 m ahead in the forward corridor (±4 m lateral).
         peds_crosswalk = [
             p for p in pedestrians
             if 0 < p["pos"][0] < 10.0 and abs(p["pos"][1]) < 4.0
@@ -280,7 +279,7 @@ class AgentExtractor(BaseExtractor):
         nearest_ped_dist = min((p["dist"] for p in pedestrians), default=None)
 
         out_ped = {
-            "pedestrian_in_crosswalk_ahead": 1.0 if peds_crosswalk else 0.0,
+            "pedestrian_ahead": 1.0 if peds_crosswalk else 0.0,
             "nearest_pedestrian_distance":   float(np.clip(nearest_ped_dist / 30.0, 0.0, 1.0))
                                              if nearest_ped_dist is not None else 1.0,
         }
@@ -525,8 +524,16 @@ _BACKEND_CONFIG = {
 }
 
 
-def _build_pass_c_prompt() -> str:
-    """Build the structured prompt listing every Pass C concept and its options."""
+_MAJORITY_VOTE_CONCEPTS = frozenset({
+    "emergency_vehicle_present",
+    "accident_or_disabled_vehicle",
+    "animal_or_debris_on_road",
+    "construction_zone",
+})
+
+
+def _build_pass_c_prompt(location: str = "") -> str:
+    """Build the structured Pass C VLM prompt with optional location context."""
     from cb_vlam.concept_mining.schema import PASS_C_SCENE_CONCEPTS
 
     categorical_lines = []
@@ -538,20 +545,49 @@ def _build_pass_c_prompt() -> str:
         else:
             binary_lines.append(f'- "{c["name"]}" (true/false) — {c["desc"]}')
 
-    return (
+    loc = location.lower()
+    if "singapore" in loc:
+        loc_line = (
+            "Scene location: Singapore. Traffic flows on the LEFT. "
+            "Speed limit signs show km/h — match the numeral on the sign to the closest "
+            "schema value without unit conversion (e.g., a sign reading '40' → '40mph')."
+        )
+    elif "boston" in loc:
+        loc_line = (
+            "Scene location: Boston, USA. Traffic flows on the RIGHT. "
+            "Speed limit signs show mph."
+        )
+    else:
+        loc_line = ""
+
+    parts = []
+    if loc_line:
+        parts.append(f"[{loc_line}]\n\n")
+    parts.append(
         "You are analyzing a front-camera image from an autonomous vehicle. "
         "Extract the following concepts and return ONLY a valid JSON object — "
         "no markdown fences, no commentary.\n\n"
         "CATEGORICAL CONCEPTS (return the string value):\n"
-        + "\n".join(categorical_lines) + "\n\n"
-        "BINARY CONCEPTS (return true or false):\n"
-        + "\n".join(binary_lines) + "\n\n"
-        "Guidelines:\n"
+    )
+    parts.append("\n".join(categorical_lines))
+    parts.append("\n\nBINARY CONCEPTS (return true or false):\n")
+    parts.append("\n".join(binary_lines))
+    parts.append(
+        "\n\nGuidelines:\n"
         "- 'lead vehicle' = the vehicle directly ahead of ego in the same lane.\n"
         "- For categoricals with a 'none' option, return 'none' if not visible/applicable.\n"
         "- Be conservative: if uncertain, return the default (false / 'none' / 'clear').\n"
-        "- Return every key from the lists above. Return ONLY the JSON object."
+        "- Return every key from the lists above. Return ONLY the JSON object.\n\n"
+        "PRECISION RULES — only set true if the criteria below are STRICTLY met:\n"
+        '- "construction_zone": Permanent road dividers, lane barriers, concrete medians, '
+        "and bollards are NOT construction zones. Only mark true for ACTIVE work: cones "
+        "delimiting an excavation or work area, workers in hi-vis vests, construction "
+        "machinery, or temporary work-zone signage.\n"
+        '- "tunnel_or_bridge_ahead": Building overhangs, covered walkways, and pedestrian '
+        "bridges over the sidewalk are NOT tunnels or bridges over the roadway. Only mark "
+        "true if the roadway itself is about to enter a tunnel portal or cross a bridge span."
     )
+    return "".join(parts)
 
 
 class SceneContextExtractor(BaseExtractor):
@@ -595,6 +631,10 @@ class SceneContextExtractor(BaseExtractor):
         super().reset()
         self._cached_labels = None
         self._precomputed: Dict[int, Dict[str, float]] = {}
+
+    def set_scene_context(self, location: str) -> None:
+        """Rebuild the VLM prompt with location-specific context. Call once per scene."""
+        self._prompt = _build_pass_c_prompt(location)
 
     def precompute_scene(
         self,
@@ -642,8 +682,7 @@ class SceneContextExtractor(BaseExtractor):
         def _call_one(frame_idx, image):
             t0 = time.monotonic()
             try:
-                raw = self._query_vlm(image)
-                return frame_idx, self._raw_to_concepts(raw), time.monotonic() - t0
+                return frame_idx, self._query_vlm_voted(image), time.monotonic() - t0
             except Exception as e:
                 return frame_idx, None, time.monotonic() - t0
 
@@ -723,8 +762,7 @@ class SceneContextExtractor(BaseExtractor):
             self._vlm_call_count = getattr(self, "_vlm_call_count", 0) + 1
             print(f"  [pass-c] frame {frame_index:3d}  call #{self._vlm_call_count} ... ",
                   end="", flush=True)
-            raw = self._query_vlm(image)
-            labels = self._raw_to_concepts(raw)
+            labels = self._query_vlm_voted(image)
             self._cached_labels = labels
             # Print a compact summary of notable non-default concepts
             notable = {k: v for k, v in labels.items()
@@ -754,6 +792,29 @@ class SceneContextExtractor(BaseExtractor):
                 elif isinstance(val, str):
                     out[name] = 1.0 if val.lower() in ("true", "yes", "1") else 0.0
         return out
+
+    def _query_vlm_voted(self, image: np.ndarray, n_votes: int = 3) -> Dict[str, float]:
+        """Query VLM with lazy majority voting for rare binary concepts.
+
+        Fires one VLM call. If any concept in _MAJORITY_VOTE_CONCEPTS fires true,
+        fires n_votes-1 additional calls and requires a strict majority (> n/2 votes)
+        to keep 1.0. Frames with no rare-concept hits pay no extra API cost.
+        """
+        base = self._raw_to_concepts(self._query_vlm(image))
+        if not any(base.get(name, 0.0) >= 0.5 for name in _MAJORITY_VOTE_CONCEPTS):
+            return base
+        raws: List[Dict[str, float]] = [base]
+        for _ in range(n_votes - 1):
+            try:
+                raws.append(self._raw_to_concepts(self._query_vlm(image)))
+            except Exception:
+                pass
+        for name in _MAJORITY_VOTE_CONCEPTS:
+            if name not in base:
+                continue
+            votes_true = sum(1 for r in raws if r.get(name, 0.0) >= 0.5)
+            base[name] = 1.0 if votes_true > len(raws) / 2 else 0.0
+        return base
 
     def _query_vlm(self, image: np.ndarray) -> Dict[str, Any]:
         """Send image to VLM via the configured OpenAI-compatible backend."""
