@@ -490,6 +490,21 @@ class InfrastructureExtractor(BaseExtractor):
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _NRP_URL = "https://ellm.nrp-nautilus.io/v1/chat/completions"
 
+# NRP fair-use per-model concurrency caps (per user). Source:
+# https://nrp.ai/documentation/userdocs/ai/llm-managed/fair-use/
+# Exceeding these is a fair-use violation even if not auto-enforced today.
+_NRP_CONCURRENCY_CAPS = {
+    "kimi": 2,
+    "glm-5": 4,
+    "minimax-m2": 8,
+    "qwen3-small": 8,
+    "gemma": 8,
+    "gemma-small": 8,
+    "qwen3": 16,
+    "gpt-oss": 16,
+    "qwen3-embedding": 16,
+}
+
 # Both backends are OpenAI-compatible — they differ only in endpoint URL,
 # the env var that holds the bearer token, and (for OpenRouter) two attribution
 # headers. Keeping the table here makes adding a third backend trivial.
@@ -601,6 +616,14 @@ class SceneContextExtractor(BaseExtractor):
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
 
+        # Compliance: cap workers at the NRP fair-use limit for this model.
+        if self.backend == "nrp":
+            cap = _NRP_CONCURRENCY_CAPS.get(self.model_name)
+            if cap is not None and max_workers > cap:
+                print(f"  [pass-c] capping vlm_workers {max_workers} -> {cap} "
+                      f"(NRP fair-use limit for {self.model_name})", flush=True)
+                max_workers = cap
+
         self._precomputed = {}
         vlm_frames = [
             (idx, img) for idx, img in indexed_images
@@ -609,23 +632,28 @@ class SceneContextExtractor(BaseExtractor):
         if not vlm_frames:
             return
 
+        import time
         call_counter = [0]
         counter_lock = threading.Lock()
         results: Dict[int, Optional[Dict[str, float]]] = {}
+        durations: List[float] = []
+        batch_start = time.monotonic()
 
         def _call_one(frame_idx, image):
+            t0 = time.monotonic()
             try:
                 raw = self._query_vlm(image)
-                return frame_idx, self._raw_to_concepts(raw)
+                return frame_idx, self._raw_to_concepts(raw), time.monotonic() - t0
             except Exception as e:
-                return frame_idx, None  # carry-forward will fill this
+                return frame_idx, None, time.monotonic() - t0
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             future_to_idx = {pool.submit(_call_one, idx, img): idx
                              for idx, img in vlm_frames}
             for future in as_completed(future_to_idx):
-                frame_idx, concepts = future.result()
+                frame_idx, concepts, dt = future.result()
                 results[frame_idx] = concepts
+                durations.append(dt)
                 with counter_lock:
                     call_counter[0] += 1
                     n = call_counter[0]
@@ -639,8 +667,17 @@ class SceneContextExtractor(BaseExtractor):
                               if notable else "")
                 else:
                     suffix = ""
-                print(f"  [pass-c] frame {frame_idx:3d}  call #{n}/{len(vlm_frames)} ... "
-                      f"{status}{suffix}", flush=True)
+                print(f"  [pass-c] frame {frame_idx:3d}  call #{n}/{len(vlm_frames)} "
+                      f"({dt:.1f}s) ... {status}{suffix}", flush=True)
+
+        wall = time.monotonic() - batch_start
+        if durations:
+            d = sorted(durations)
+            med = d[len(d) // 2]
+            print(f"  [pass-c] batch wall={wall:.1f}s  "
+                  f"per-call min={d[0]:.1f}s median={med:.1f}s max={d[-1]:.1f}s  "
+                  f"effective_concurrency={sum(durations)/wall:.2f}x",
+                  flush=True)
 
         # Apply carry-forward in frame order to fill self._precomputed
         cached = None

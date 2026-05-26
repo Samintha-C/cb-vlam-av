@@ -152,7 +152,8 @@ def mine(data_root: Path,
          vlm_model: str = "google/gemini-2.5-flash",
          keyframe_stride: int = 1,
          sample_tokens_file: Optional[Path] = None,
-         vlm_workers: int = 1) -> None:
+         vlm_workers: int = 1,
+         vlm_image_dim: int = 1024) -> None:
     """Main mining loop.
 
     Args:
@@ -181,7 +182,8 @@ def mine(data_root: Path,
     agent = AgentExtractor()
     infra = InfrastructureExtractor()
     scene_ctx = SceneContextExtractor(backend=vlm_backend, model_name=vlm_model,
-                                       keyframe_stride=keyframe_stride)
+                                       keyframe_stride=keyframe_stride,
+                                       max_image_dim=vlm_image_dim)
 
     all_records: List[Dict[str, Any]] = []
     vlm_calls_total = 0
@@ -240,6 +242,10 @@ def main():
     parser.add_argument("--vlm_workers", type=int, default=1,
                         help="Concurrent VLM calls per scene. Use 8 for qwen3-small, "
                              "16 for qwen3 (NRP fair-use limits).")
+    parser.add_argument("--vlm_image_dim", type=int, default=1024,
+                        help="Max dimension (longer side) for images sent to the VLM. "
+                             "Smaller = fewer image tokens = faster inference. "
+                             "Try 512 if VLM is the bottleneck.")
     parser.add_argument("--sample_tokens_file", type=str, default=None,
                         help="JSON file restricting mining to specific sample_tokens. "
                              "Accepts either a bare list of tokens or Impromptu-VLA "
@@ -262,6 +268,7 @@ def main():
         keyframe_stride=args.keyframe_stride,
         sample_tokens_file=Path(args.sample_tokens_file) if args.sample_tokens_file else None,
         vlm_workers=args.vlm_workers,
+        vlm_image_dim=args.vlm_image_dim,
     )
 
 
