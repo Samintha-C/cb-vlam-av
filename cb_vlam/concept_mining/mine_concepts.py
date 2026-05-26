@@ -156,7 +156,8 @@ def mine(data_root: Path,
          sample_tokens_file: Optional[Path] = None,
          vlm_workers: int = 1,
          vlm_image_dim: int = 1024,
-         vlm_verbose: bool = False) -> None:
+         vlm_verbose: bool = False,
+         vlm_timeout: int = 180) -> None:
     """Main mining loop."""
     sample_token_filter: Optional[Set[str]] = None
     if sample_tokens_file is not None:
@@ -177,7 +178,8 @@ def mine(data_root: Path,
     scene_ctx = SceneContextExtractor(backend=vlm_backend, model_name=vlm_model,
                                        keyframe_stride=keyframe_stride,
                                        max_image_dim=vlm_image_dim,
-                                       verbose=vlm_verbose)
+                                       verbose=vlm_verbose,
+                                       request_timeout=vlm_timeout)
 
     all_records: List[Dict[str, Any]] = []
     vlm_calls_total = 0
@@ -247,6 +249,9 @@ def main():
     parser.add_argument("--vlm_verbose", action="store_true",
                         help="Print raw VLM response and CoT trace (reasoning_content) "
                              "for every call. Useful for diagnosing concept misfires.")
+    parser.add_argument("--vlm_timeout", type=int, default=180,
+                        help="Per-call HTTP timeout in seconds. Bump to 300-600 for "
+                             "qwen3 (full) which is slower than qwen3-small.")
     args = parser.parse_args()
 
     passes = list(args.passes.lower())
@@ -267,6 +272,7 @@ def main():
         vlm_workers=args.vlm_workers,
         vlm_image_dim=args.vlm_image_dim,
         vlm_verbose=args.vlm_verbose,
+        vlm_timeout=args.vlm_timeout,
     )
 
 

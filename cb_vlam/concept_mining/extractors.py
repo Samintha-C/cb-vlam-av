@@ -687,6 +687,8 @@ class SceneContextExtractor(BaseExtractor):
                 concepts = self._query_vlm_voted(image, label=f"f{frame_idx}")
                 return frame_idx, concepts, time.monotonic() - t0
             except Exception as e:
+                err = f"{type(e).__name__}: {str(e)[:300]}"
+                print(f"  [pass-c] frame {frame_idx:3d}  ERROR: {err}", flush=True)
                 return frame_idx, None, time.monotonic() - t0
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
