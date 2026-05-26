@@ -684,7 +684,8 @@ class SceneContextExtractor(BaseExtractor):
         def _call_one(frame_idx, image):
             t0 = time.monotonic()
             try:
-                return frame_idx, self._query_vlm_voted(image), time.monotonic() - t0
+                concepts = self._query_vlm_voted(image, label=f"f{frame_idx}")
+                return frame_idx, concepts, time.monotonic() - t0
             except Exception as e:
                 return frame_idx, None, time.monotonic() - t0
 
@@ -764,7 +765,7 @@ class SceneContextExtractor(BaseExtractor):
             self._vlm_call_count = getattr(self, "_vlm_call_count", 0) + 1
             print(f"  [pass-c] frame {frame_index:3d}  call #{self._vlm_call_count} ... ",
                   end="", flush=True)
-            labels = self._query_vlm_voted(image)
+            labels = self._query_vlm_voted(image, label=f"f{frame_index}")
             self._cached_labels = labels
             # Print a compact summary of notable non-default concepts
             notable = {k: v for k, v in labels.items()
@@ -795,31 +796,47 @@ class SceneContextExtractor(BaseExtractor):
                     out[name] = 1.0 if val.lower() in ("true", "yes", "1") else 0.0
         return out
 
-    def _query_vlm_voted(self, image: np.ndarray, n_votes: int = 3) -> Dict[str, float]:
+    def _query_vlm_voted(self, image: np.ndarray, n_votes: int = 3,
+                         label: str = "") -> Dict[str, float]:
         """Query VLM with lazy majority voting for rare binary concepts.
 
         Fires one VLM call. If any concept in _MAJORITY_VOTE_CONCEPTS fires true,
         fires n_votes-1 additional calls and requires a strict majority (> n/2 votes)
         to keep 1.0. Frames with no rare-concept hits pay no extra API cost.
+
+        `label` is propagated to every verbose log line so concurrent frames'
+        outputs can be told apart.
         """
-        base = self._raw_to_concepts(self._query_vlm(image))
+        base_label = f"{label} v1" if label else ""
+        base = self._raw_to_concepts(self._query_vlm(image, label=base_label))
         if not any(base.get(name, 0.0) >= 0.5 for name in _MAJORITY_VOTE_CONCEPTS):
             return base
         raws: List[Dict[str, float]] = [base]
-        for _ in range(n_votes - 1):
+        for i in range(n_votes - 1):
+            vote_label = f"{label} v{i+2}" if label else f"v{i+2}"
             try:
-                raws.append(self._raw_to_concepts(self._query_vlm(image)))
+                raws.append(self._raw_to_concepts(self._query_vlm(image, label=vote_label)))
             except Exception:
                 pass
         for name in _MAJORITY_VOTE_CONCEPTS:
             if name not in base:
                 continue
             votes_true = sum(1 for r in raws if r.get(name, 0.0) >= 0.5)
-            base[name] = 1.0 if votes_true > len(raws) / 2 else 0.0
+            new_val = 1.0 if votes_true > len(raws) / 2 else 0.0
+            if self.verbose and base[name] >= 0.5:
+                decision = "kept" if new_val >= 0.5 else "rejected"
+                tag = f" {label}" if label else ""
+                print(f"  [vlm-vote{tag}] {name}: {votes_true}/{len(raws)} → {decision}",
+                      flush=True)
+            base[name] = new_val
         return base
 
-    def _query_vlm(self, image: np.ndarray) -> Dict[str, Any]:
-        """Send image to VLM via the configured OpenAI-compatible backend."""
+    def _query_vlm(self, image: np.ndarray, label: str = "") -> Dict[str, Any]:
+        """Send image to VLM via the configured OpenAI-compatible backend.
+
+        `label` is appended to verbose log tags so concurrent calls can be
+        distinguished (e.g., ``[vlm-raw f12 v2]``).
+        """
         import base64
         import json
         import os
@@ -886,9 +903,11 @@ class SceneContextExtractor(BaseExtractor):
                 reasoning = msg.get("reasoning_content", "")
                 content = msg["content"]
                 if self.verbose:
+                    tag = f" {label}" if label else ""
                     if reasoning:
-                        print(f"\n  [vlm-cot]\n{reasoning}\n  [/vlm-cot]", flush=True)
-                    print(f"  [vlm-raw] {content!r}", flush=True)
+                        print(f"\n  [vlm-cot{tag}]\n{reasoning}\n  [/vlm-cot{tag}]",
+                              flush=True)
+                    print(f"  [vlm-raw{tag}] {content!r}", flush=True)
                 # Strip stray markdown fences if present
                 content = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                 return json.loads(content)
