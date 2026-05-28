@@ -54,6 +54,7 @@ class NuScenesLoader:
         self.load_maps = load_maps
         self._nusc = None
         self._maps: Dict[str, Any] = {}
+        self._attribute_name_by_token: Dict[str, str] = {}
 
     def _load(self) -> None:
         """Lazy-load the nuScenes object on first use."""
@@ -65,6 +66,11 @@ class NuScenesLoader:
             dataroot=str(self.data_root),
             verbose=self.verbose,
         )
+        # Resolve attribute tokens once so extractors can read
+        # ann["attribute_names"] without keeping a handle to the nusc object.
+        self._attribute_name_by_token = {
+            a["token"]: a["name"] for a in self._nusc.attribute
+        }
 
     def _get_map(self, location: str) -> Any:
         """Get or load the NuScenesMap for a given location (e.g., 'boston-seaport')."""
@@ -134,11 +140,17 @@ class NuScenesLoader:
             lidar_sd = self._nusc.get("sample_data", sample["data"]["LIDAR_TOP"])
             ego_pose = self._nusc.get("ego_pose", lidar_sd["ego_pose_token"])
 
-            # Sample annotations (3D boxes) by token
-            annotations = [
-                self._nusc.get("sample_annotation", t)
-                for t in sample["anns"]
-            ]
+            # Sample annotations (3D boxes) by token. Copy each record so the
+            # injected attribute_names list doesn't mutate the devkit's cached
+            # tables.
+            annotations = []
+            for t in sample["anns"]:
+                ann = dict(self._nusc.get("sample_annotation", t))
+                ann["attribute_names"] = [
+                    self._attribute_name_by_token[at]
+                    for at in ann.get("attribute_tokens", [])
+                ]
+                annotations.append(ann)
 
             # Front camera path + (optionally) image
             cam_sd = self._nusc.get("sample_data", sample["data"]["CAM_FRONT"])

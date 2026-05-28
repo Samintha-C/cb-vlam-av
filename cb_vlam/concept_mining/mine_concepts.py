@@ -108,6 +108,7 @@ def mine_scene(loader: NuScenesLoader,
                     ego_pose=sample["ego_pose"],
                     annotations=sample["annotations"],
                     prev_annotations=prev_sample["annotations"] if prev_sample else None,
+                    nusc_map=scene_info["nusc_map"],
                 )
                 concepts.update(b_agent)
             except NotImplementedError:

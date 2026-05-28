@@ -17,6 +17,7 @@ PASS_A_CONCEPTS: List[Dict] = [
     {"name": "ego_stopped", "type": "binary", "desc": "1.0 if ego speed < 0.5 m/s"},
     {"name": "ego_braking", "type": "binary", "desc": "1.0 if ego acceleration < -1 m/s^2"},
     {"name": "ego_turning", "type": "binary", "desc": "1.0 if abs(ego yaw rate) > 0.1 rad/s"},
+    {"name": "lateral_acceleration", "type": "float", "desc": "Lateral accel = yaw_rate * forward_speed (m/s^2), normalized to [-1, 1] over [-5, 5]"},
 ]
 
 PASS_B_AGENT_CONCEPTS: List[Dict] = [
@@ -31,6 +32,16 @@ PASS_B_AGENT_CONCEPTS: List[Dict] = [
     {"name": "left_lane_blocked", "type": "binary", "desc": "1.0 if a moving vehicle (|v|>0.5 m/s) occupies the immediately adjacent left lane within ±20m"},
     {"name": "right_lane_blocked", "type": "binary", "desc": "1.0 if a moving vehicle (|v|>0.5 m/s) occupies the immediately adjacent right lane within ±20m"},
     {"name": "parked_cars_present", "type": "binary", "desc": "1.0 if any stationary vehicle (|v|<0.5 m/s) is in the side bands within ±15m"},
+    # ── Deterministic annotation-based concepts (suffix _det disambiguates
+    # from VLM versions of the same concept in Pass C).
+    {"name": "emergency_vehicle_present_det", "type": "binary", "desc": "1.0 if any vehicle.emergency.* annotation within 30m (ambulance/police/fire)"},
+    {"name": "construction_zone_det", "type": "binary", "desc": "1.0 if any construction-class object within 30m (movable_object.barrier ∪ movable_object.trafficcone ∪ human.pedestrian.construction_worker ∪ vehicle.construction)"},
+    {"name": "animal_or_debris_on_road_det", "type": "binary", "desc": "1.0 if any animal or movable_object.debris annotation within 30m"},
+    {"name": "pedestrian_intent_crossing_det", "type": "binary", "desc": "1.0 if any pedestrian with pedestrian.moving attribute is within 15m of a ped_crossing polygon"},
+    {"name": "pedestrian_density", "type": "float", "desc": "Count of pedestrians within 30m, normalized [0, 1] over [0, 5]"},
+    {"name": "traffic_density_det", "type": "categorical", "values": ["light", "moderate", "heavy"], "desc": "Discretized vehicle_count_nearby: light=0-2, moderate=3-5, heavy=6+"},
+    {"name": "time_to_collision_lead", "type": "float", "desc": "Lead distance / closing rate (s), clipped to [0, 1] over [0, 10]. 1.0 if no lead or not closing."},
+    {"name": "following_distance_seconds", "type": "float", "desc": "Lead distance / ego speed (s), clipped to [0, 1] over [0, 5]. 1.0 if no lead or ego stopped."},
 ]
 
 PASS_B_INFRA_CONCEPTS: List[Dict] = [
@@ -41,6 +52,13 @@ PASS_B_INFRA_CONCEPTS: List[Dict] = [
     {"name": "speed_limit_normalized", "type": "float", "desc": "Speed limit on current segment (m/s), normalized [0, 1] over [0, 35]"},
     {"name": "road_curvature_ahead", "type": "float", "desc": "Curvature of the lane centerline 30m ahead (1/m), normalized [-1, 1] over [-0.05, 0.05]"},
     {"name": "in_intersection", "type": "binary", "desc": "1.0 if ego is currently inside an intersection polygon"},
+    # ── Deterministic map-layer concepts.
+    {"name": "over_stop_line", "type": "binary", "desc": "1.0 if ego position is on a stop_line polygon"},
+    {"name": "nearest_crosswalk_distance", "type": "float", "desc": "Distance to nearest ped_crossing polygon (m), normalized [0, 1] over [0, 30]. 1.0 if none within 30m."},
+    {"name": "on_walkway", "type": "binary", "desc": "1.0 if ego position is on a walkway polygon (anomaly: ego should not be on sidewalks)"},
+    {"name": "in_carpark", "type": "binary", "desc": "1.0 if ego position is inside a carpark_area polygon"},
+    {"name": "traffic_light_location_ahead", "type": "binary", "desc": "1.0 if any traffic_light polygon is within 50m ahead of ego (location only; state is VLM-only)"},
+    {"name": "ego_lateral_offset_in_lane", "type": "float", "desc": "Perpendicular distance from ego to current lane centerline (m), normalized [-1, 1] over [-2, 2]. 0.0 if no lane found."},
 ]
 
 PASS_C_SCENE_CONCEPTS: List[Dict] = [

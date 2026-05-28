@@ -109,6 +109,7 @@ class KinematicExtractor(BaseExtractor):
                 "ego_stopped": 1.0,
                 "ego_braking": 0.0,
                 "ego_turning": 0.0,
+                "lateral_acceleration": 0.0,
             }
 
         dt = (ego_pose["timestamp"] - prev_ego_pose["timestamp"]) / 1e6
@@ -132,6 +133,7 @@ class KinematicExtractor(BaseExtractor):
         speed_norm = _clip(speed_mps / self.max_speed_mps, 0.0, 1.0)
         prev_speed_norm = _clip(prev_speed_mps / self.max_speed_mps, 0.0, 1.0)
 
+        lat_accel_mps2 = yaw_rate_radps * speed_mps
         out = {
             "ego_speed": speed_norm,
             "ego_acceleration": _clip(accel_mps2 / self.max_accel_mps2, -1.0, 1.0),
@@ -140,6 +142,7 @@ class KinematicExtractor(BaseExtractor):
             "ego_stopped": 1.0 if speed_mps < self.stopped_speed_mps else 0.0,
             "ego_braking": 1.0 if accel_mps2 < self.braking_accel_mps2 else 0.0,
             "ego_turning": 1.0 if abs(yaw_rate_radps) > self.turning_yaw_rate_radps else 0.0,
+            "lateral_acceleration": _clip(lat_accel_mps2 / self.max_accel_mps2, -1.0, 1.0),
         }
 
         self.prev_state = {"speed_mps": speed_mps, "yaw": cur_yaw}
@@ -162,24 +165,40 @@ class AgentExtractor(BaseExtractor):
                  lead_vehicle_max_distance_m: float = 50.0,
                  nearby_vehicle_range_m: float = 30.0,
                  pedestrian_check_range_m: float = 20.0,
-                 lane_width_m: float = 3.5):
+                 lane_width_m: float = 3.5,
+                 class_presence_radius_m: float = 30.0,
+                 ped_intent_radius_m: float = 15.0,
+                 ped_intent_crosswalk_radius_m: float = 5.0,
+                 ttc_max_seconds: float = 10.0,
+                 following_max_seconds: float = 5.0,
+                 ped_density_max_count: float = 5.0):
         super().__init__()
         self.lead_vehicle_max_distance_m = lead_vehicle_max_distance_m
         self.nearby_vehicle_range_m = nearby_vehicle_range_m
         self.pedestrian_check_range_m = pedestrian_check_range_m
         self.lane_width_m = lane_width_m
+        self.class_presence_radius_m = class_presence_radius_m
+        self.ped_intent_radius_m = ped_intent_radius_m
+        self.ped_intent_crosswalk_radius_m = ped_intent_crosswalk_radius_m
+        self.ttc_max_seconds = ttc_max_seconds
+        self.following_max_seconds = following_max_seconds
+        self.ped_density_max_count = ped_density_max_count
 
     def extract(self,
                 ego_pose: Dict[str, Any],
                 annotations: List[Dict[str, Any]],
-                prev_annotations: Optional[List[Dict[str, Any]]] = None) -> Dict[str, float]:
+                prev_annotations: Optional[List[Dict[str, Any]]] = None,
+                nusc_map: Optional[Any] = None) -> Dict[str, float]:
         """Extract agent concepts for one frame.
 
         Args:
             ego_pose: Ego pose record.
             annotations: List of nuScenes sample_annotation records visible at this timestamp.
-                Each has 'translation', 'size', 'rotation', 'category_name', 'instance_token'.
+                Each has 'translation', 'size', 'rotation', 'category_name', 'instance_token',
+                'attribute_names' (resolved by the loader from attribute_tokens).
             prev_annotations: Annotations from previous frame, for velocity computation.
+            nusc_map: NuScenesMap handle. Required for pedestrian_intent_crossing_det
+                (defaults to 0 if not provided).
 
         Returns:
             Dict with keys matching PASS_B_AGENT_CONCEPTS schema.
@@ -256,11 +275,25 @@ class AgentExtractor(BaseExtractor):
             prev_lead_vel = self.prev_state.get("lead_vel_fwd", 0.0) if self.prev_state else 0.0
             lead_accel = (lead_vel_fwd - prev_lead_vel) / dt
 
+            lead_dist_m = float(lead["pos"][0])
+            # Time-to-collision: only meaningful if actively closing.
+            if closing_rate > 0.1:
+                ttc_norm = float(np.clip(lead_dist_m / closing_rate / self.ttc_max_seconds, 0.0, 1.0))
+            else:
+                ttc_norm = 1.0
+            # Following distance in seconds: only meaningful if ego moving forward.
+            if ego_speed_mps > 0.5:
+                follow_norm = float(np.clip(lead_dist_m / ego_speed_mps / self.following_max_seconds, 0.0, 1.0))
+            else:
+                follow_norm = 1.0
+
             out_lead = {
                 "lead_vehicle_present":           1.0,
-                "lead_vehicle_distance":          float(np.clip(lead["pos"][0] / self.lead_vehicle_max_distance_m, 0.0, 1.0)),
+                "lead_vehicle_distance":          float(np.clip(lead_dist_m / self.lead_vehicle_max_distance_m, 0.0, 1.0)),
                 "lead_vehicle_relative_velocity": float(np.clip(closing_rate / 10.0, -1.0, 1.0)),
                 "lead_vehicle_decelerating":      1.0 if lead_accel < -1.0 else 0.0,
+                "time_to_collision_lead":         ttc_norm,
+                "following_distance_seconds":     follow_norm,
             }
         else:
             out_lead = {
@@ -268,6 +301,8 @@ class AgentExtractor(BaseExtractor):
                 "lead_vehicle_distance":          1.0,
                 "lead_vehicle_relative_velocity": 0.0,
                 "lead_vehicle_decelerating":      0.0,
+                "time_to_collision_lead":         1.0,
+                "following_distance_seconds":     1.0,
             }
 
         # ── Pedestrians ───────────────────────────────────────────────────────
@@ -317,12 +352,86 @@ class AgentExtractor(BaseExtractor):
             if abs(v["pos"][1]) > L * 0.5 and abs(v["pos"][0]) < 15.0
         )
 
+        # ── Deterministic class-presence concepts ────────────────────────────
+        # All use a 30m radius (class_presence_radius_m). Iterate annotations
+        # once per class rather than reusing the vehicle/ped/cyclist buckets,
+        # which filtered out movable_object.* and animal.* categories.
+        def _ann_ego_dist(a):
+            return float(np.linalg.norm(to_ego_frame(a["translation"])[:2]))
+
+        R = self.class_presence_radius_m
+        construction_prefixes = (
+            "movable_object.barrier",
+            "movable_object.trafficcone",
+            "human.pedestrian.construction_worker",
+            "vehicle.construction",
+        )
+        emergency_present = any(
+            a["category_name"].startswith("vehicle.emergency.") and _ann_ego_dist(a) < R
+            for a in annotations
+        )
+        construction_present = any(
+            a["category_name"].startswith(construction_prefixes) and _ann_ego_dist(a) < R
+            for a in annotations
+        )
+        animal_or_debris = any(
+            (a["category_name"].startswith("animal")
+             or a["category_name"].startswith("movable_object.debris"))
+            and _ann_ego_dist(a) < R
+            for a in annotations
+        )
+
+        # ── Pedestrian intent crossing ───────────────────────────────────────
+        # A pedestrian with pedestrian.moving attribute, within 15m of ego AND
+        # within 5m of a ped_crossing polygon, signals likely crossing intent.
+        ped_intent = 0.0
+        if nusc_map is not None:
+            for ped in pedestrians:
+                if ped["dist"] > self.ped_intent_radius_m:
+                    continue
+                if "pedestrian.moving" not in ped["ann"].get("attribute_names", []):
+                    continue
+                gx = float(ped["ann"]["translation"][0])
+                gy = float(ped["ann"]["translation"][1])
+                try:
+                    crossings = nusc_map.get_records_in_radius(
+                        gx, gy, self.ped_intent_crosswalk_radius_m, ["ped_crossing"]
+                    )["ped_crossing"]
+                except Exception:
+                    crossings = []
+                if crossings:
+                    ped_intent = 1.0
+                    break
+
+        # ── Pedestrian density ───────────────────────────────────────────────
+        ped_count_nearby = sum(
+            1 for p in pedestrians if p["dist"] < self.class_presence_radius_m
+        )
+        ped_density_norm = float(np.clip(
+            ped_count_nearby / self.ped_density_max_count, 0.0, 1.0
+        ))
+
+        # ── Traffic density (categorical, encoded as float index) ────────────
+        # 0=light (0-2 vehicles), 1=moderate (3-5), 2=heavy (6+)
+        if nearby_count >= 6:
+            traffic_dens_idx = 2.0
+        elif nearby_count >= 3:
+            traffic_dens_idx = 1.0
+        else:
+            traffic_dens_idx = 0.0
+
         out_misc = {
             "vehicle_count_nearby":  float(np.clip(nearby_count / 10.0, 0.0, 1.0)),
             "cyclist_present":       1.0 if cyc_close else 0.0,
             "left_lane_blocked":     1.0 if left_blocked  else 0.0,
             "right_lane_blocked":    1.0 if right_blocked else 0.0,
             "parked_cars_present":   1.0 if parked        else 0.0,
+            "emergency_vehicle_present_det":  1.0 if emergency_present else 0.0,
+            "construction_zone_det":          1.0 if construction_present else 0.0,
+            "animal_or_debris_on_road_det":   1.0 if animal_or_debris else 0.0,
+            "pedestrian_intent_crossing_det": ped_intent,
+            "pedestrian_density":             ped_density_norm,
+            "traffic_density_det":            traffic_dens_idx,
         }
 
         # ── Update state ──────────────────────────────────────────────────────
@@ -354,13 +463,19 @@ class InfrastructureExtractor(BaseExtractor):
                  max_intersection_distance_m: float = 100.0,
                  lane_search_radius_m: float = 2.0,
                  lane_width_m: float = 3.5,
-                 max_curvature_per_m: float = 0.05):
+                 max_curvature_per_m: float = 0.05,
+                 max_crosswalk_distance_m: float = 30.0,
+                 max_traffic_light_distance_m: float = 50.0,
+                 max_lateral_offset_m: float = 2.0):
         super().__init__()
         self.lookahead_m = lookahead_m
         self.max_intersection_distance_m = max_intersection_distance_m
         self.lane_search_radius_m = lane_search_radius_m
         self.lane_width_m = lane_width_m
         self.max_curvature_per_m = max_curvature_per_m
+        self.max_crosswalk_distance_m = max_crosswalk_distance_m
+        self.max_traffic_light_distance_m = max_traffic_light_distance_m
+        self.max_lateral_offset_m = max_lateral_offset_m
 
     @staticmethod
     def _menger_curvature_signed(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray) -> float:
@@ -384,7 +499,9 @@ class InfrastructureExtractor(BaseExtractor):
         yaw = _yaw_from_quaternion_wxyz(ego_pose["rotation"])
         forward = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float64)
 
-        # ── in_intersection ───────────────────────────────────────────────────
+        # ── in_intersection + point-in-polygon concepts ──────────────────────
+        # layers_on_point returns a dict {layer_name: token or ""} for every
+        # polygonal layer that the (x, y) point falls inside.
         in_intersection = 0.0
         layers = nusc_map.layers_on_point(x, y)
         rs_token = layers.get("road_segment", "")
@@ -392,6 +509,9 @@ class InfrastructureExtractor(BaseExtractor):
             rs = nusc_map.get("road_segment", rs_token)
             if rs.get("is_intersection", False):
                 in_intersection = 1.0
+        over_stop_line = 1.0 if layers.get("stop_line") else 0.0
+        on_walkway     = 1.0 if layers.get("walkway") else 0.0
+        in_carpark     = 1.0 if layers.get("carpark_area") else 0.0
 
         # ── distance_to_intersection ──────────────────────────────────────────
         # Search nearby road_segments and walkways for the closest intersection
@@ -428,10 +548,47 @@ class InfrastructureExtractor(BaseExtractor):
             dist_norm = float(min(min_fwd_dist / self.max_intersection_distance_m, 1.0))
             approaching = 1.0 if min_fwd_dist < 30.0 else 0.0
 
+        # ── nearest crosswalk distance ───────────────────────────────────────
+        # ped_crossing polygons. Distance is to polygon centroid; 1.0 if none
+        # within max_crosswalk_distance_m.
+        nearby_xwalks = nusc_map.get_records_in_radius(
+            x, y, self.max_crosswalk_distance_m, ["ped_crossing"]
+        )["ped_crossing"]
+        min_xwalk_dist = float("inf")
+        for tok in nearby_xwalks:
+            rec = nusc_map.get("ped_crossing", tok)
+            try:
+                poly = nusc_map.extract_polygon(rec["polygon_token"])
+                cx, cy = poly.centroid.x, poly.centroid.y
+            except Exception:
+                continue
+            d = float(np.linalg.norm([cx - x, cy - y]))
+            if d < min_xwalk_dist:
+                min_xwalk_dist = d
+        if min_xwalk_dist == float("inf"):
+            crosswalk_dist_norm = 1.0
+        else:
+            crosswalk_dist_norm = float(
+                min(min_xwalk_dist / self.max_crosswalk_distance_m, 1.0)
+            )
+
+        # ── traffic_light_location_ahead ─────────────────────────────────────
+        # Binary: any traffic_light record within max_traffic_light_distance_m.
+        # nuScenes traffic_light layer encodes location only, no signal state.
+        try:
+            nearby_tls = nusc_map.get_records_in_radius(
+                x, y, self.max_traffic_light_distance_m, ["traffic_light"]
+            )["traffic_light"]
+            tl_location_ahead = 1.0 if nearby_tls else 0.0
+        except Exception:
+            # Some map locations may not include the traffic_light layer.
+            tl_location_ahead = 0.0
+
         # ── lane availability + curvature ─────────────────────────────────────
         lane_left = 0.0
         lane_right = 0.0
         curvature_norm = 0.0
+        lateral_offset_norm = 0.0
 
         current_lane_token = nusc_map.get_closest_lane(x, y, radius=self.lane_search_radius_m)
         if current_lane_token:
@@ -457,6 +614,12 @@ class InfrastructureExtractor(BaseExtractor):
                     lane_yaw = float(poses[nearest_idx][2])
                     # Perpendicular: left is +90° from heading
                     perp_left = np.array([-np.sin(lane_yaw), np.cos(lane_yaw)])
+                    # Signed lateral offset (+ = ego left of centerline)
+                    ego_minus_lane = np.array([x, y]) - lane_xy[nearest_idx]
+                    lateral_offset_m = float(np.dot(ego_minus_lane, perp_left))
+                    lateral_offset_norm = float(np.clip(
+                        lateral_offset_m / self.max_lateral_offset_m, -1.0, 1.0
+                    ))
                     probe_left = np.array([x, y]) + perp_left * self.lane_width_m
                     probe_right = np.array([x, y]) - perp_left * self.lane_width_m
 
@@ -483,6 +646,12 @@ class InfrastructureExtractor(BaseExtractor):
             "speed_limit_normalized":   0.0,
             "road_curvature_ahead":     curvature_norm,
             "in_intersection":          in_intersection,
+            "over_stop_line":               over_stop_line,
+            "nearest_crosswalk_distance":   crosswalk_dist_norm,
+            "on_walkway":                   on_walkway,
+            "in_carpark":                   in_carpark,
+            "traffic_light_location_ahead": tl_location_ahead,
+            "ego_lateral_offset_in_lane":   lateral_offset_norm,
         }
 
 
