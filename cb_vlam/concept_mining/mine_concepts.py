@@ -151,6 +151,7 @@ def mine(data_root: Path,
          output_path: Path,
          passes: List[str],
          max_scenes: Optional[int] = None,
+         locations: Optional[List[str]] = None,
          vlm_backend: str = "openrouter",
          vlm_model: str = "google/gemini-2.5-flash",
          keyframe_stride: int = 1,
@@ -185,8 +186,15 @@ def mine(data_root: Path,
     all_records: List[Dict[str, Any]] = []
     vlm_calls_total = 0
 
-    scenes = list(loader.iter_scenes(max_scenes=max_scenes))
-    print(f"Mining {len(scenes)} scenes  |  passes={passes}  |  "
+    scenes = list(loader.iter_scenes())
+    if locations is not None:
+        loc_set = set(locations)
+        scenes = [s for s in scenes if s["location"] in loc_set]
+    if max_scenes is not None:
+        scenes = scenes[:max_scenes]
+
+    loc_str = ",".join(sorted(set(s["location"] for s in scenes))) if scenes else "none"
+    print(f"Mining {len(scenes)} scenes  |  passes={passes}  |  locations={loc_str}  |  "
           f"vlm={vlm_model if 'c' in passes else 'n/a'}  |  "
           f"keyframe_stride={keyframe_stride if 'c' in passes else 'n/a'}")
 
@@ -230,7 +238,13 @@ def main():
     parser.add_argument("--passes", type=str, default="ab",
                         help="Which passes to run, e.g., 'a', 'ab', 'abc'")
     parser.add_argument("--max_scenes", type=int, default=None,
-                        help="Limit number of scenes (for development)")
+                        help="Limit number of scenes (applied after --locations filter)")
+    parser.add_argument("--locations", type=str, default=None,
+                        help="Comma-separated list of nuScenes map locations to include, "
+                             "e.g. 'boston-seaport' or 'boston-seaport,singapore-onenorth'. "
+                             "Valid: boston-seaport, singapore-hollandvillage, "
+                             "singapore-onenorth, singapore-queenstown. "
+                             "Default: all locations.")
     parser.add_argument("--vlm_backend", type=str, default="openrouter",
                         choices=["openrouter", "nrp"])
     parser.add_argument("--vlm_model", type=str, default="google/gemini-2.5-flash")
@@ -260,12 +274,15 @@ def main():
     if not set(passes).issubset(valid):
         raise ValueError(f"Invalid passes: {args.passes}. Must be subset of 'abc'.")
 
+    locations = [l.strip() for l in args.locations.split(",")] if args.locations else None
+
     mine(
         data_root=Path(args.data_root),
         version=args.version,
         output_path=Path(args.output_path),
         passes=passes,
         max_scenes=args.max_scenes,
+        locations=locations,
         vlm_backend=args.vlm_backend,
         vlm_model=args.vlm_model,
         keyframe_stride=args.keyframe_stride,

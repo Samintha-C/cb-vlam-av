@@ -760,9 +760,29 @@ class InfrastructureExtractor(BaseExtractor):
                         float(probe_right[0]), float(probe_right[1]),
                         radius=self.lane_search_radius_m,
                     )
-                    if left_tok and left_tok != current_lane_token:
+
+                    def _is_same_direction(probe_tok: str) -> bool:
+                        """True iff probe lane exists, differs from current, and
+                        heads within 45° of the current lane (cos > 0.7).
+                        Rejects opposing lanes (cos ≈ -1) and cross-street /
+                        intersection lanes (cos ≈ 0) that are positionally close
+                        but not actual same-direction lane-change targets."""
+                        if not probe_tok or probe_tok == current_lane_token:
+                            return False
+                        arc = nusc_map.arcline_path_3.get(probe_tok)
+                        if arc is None:
+                            return False
+                        probe_poses = arcline_path_utils.discretize_lane(
+                            arc, resolution_meters=2.0
+                        )
+                        if not probe_poses:
+                            return False
+                        probe_yaw = probe_poses[0][2]
+                        return float(np.cos(probe_yaw - lane_yaw)) > 0.7
+
+                    if _is_same_direction(left_tok):
                         lane_left = 1.0
-                    if right_tok and right_tok != current_lane_token:
+                    if _is_same_direction(right_tok):
                         lane_right = 1.0
 
         return {
