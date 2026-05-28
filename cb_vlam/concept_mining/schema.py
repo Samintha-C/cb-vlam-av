@@ -13,7 +13,7 @@ PASS_A_CONCEPTS: List[Dict] = [
     {"name": "ego_speed", "type": "float", "desc": "Ego vehicle speed (m/s), normalized to [0, 1] over [0, 30]"},
     {"name": "ego_acceleration", "type": "float", "desc": "Ego longitudinal acceleration (m/s^2), normalized to [-1, 1] over [-5, 5]"},
     {"name": "ego_yaw_rate", "type": "float", "desc": "Ego yaw rate (rad/s), normalized to [-1, 1] over [-pi/4, pi/4]"},
-    {"name": "ego_speed_delta", "type": "float", "desc": "Frame-to-frame change in normalized ego speed"},
+    {"name": "ego_speed_delta", "type": "float", "desc": "Speed change over the last ~1.5 s (lookback_frames=3 at 2 Hz), normalized [-1, 1] over [-30, 30] m/s. Captures sustained deceleration trends; distinct from the instantaneous ego_acceleration signal."},
     {"name": "ego_stopped", "type": "binary", "desc": "1.0 if ego speed < 0.5 m/s"},
     {"name": "ego_braking", "type": "binary", "desc": "1.0 if ego acceleration < -1 m/s^2"},
     {"name": "ego_turning", "type": "binary", "desc": "1.0 if abs(ego yaw rate) > 0.1 rad/s"},

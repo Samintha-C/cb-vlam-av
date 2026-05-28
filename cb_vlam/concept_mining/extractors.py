@@ -67,7 +67,8 @@ class KinematicExtractor(BaseExtractor):
                  max_yaw_rate_radps: float = np.pi / 4,
                  stopped_speed_mps: float = 0.5,
                  braking_accel_mps2: float = -1.0,
-                 turning_yaw_rate_radps: float = 0.1):
+                 turning_yaw_rate_radps: float = 0.1,
+                 lookback_frames: int = 3):
         super().__init__()
         self.max_speed_mps = max_speed_mps
         self.max_accel_mps2 = max_accel_mps2
@@ -75,6 +76,7 @@ class KinematicExtractor(BaseExtractor):
         self.stopped_speed_mps = stopped_speed_mps
         self.braking_accel_mps2 = braking_accel_mps2
         self.turning_yaw_rate_radps = turning_yaw_rate_radps
+        self.lookback_frames = lookback_frames
 
     def extract(self,
                 ego_pose: Dict[str, Any],
@@ -100,6 +102,7 @@ class KinematicExtractor(BaseExtractor):
             self.prev_state = {
                 "speed_mps": 0.0,
                 "yaw": _yaw_from_quaternion_wxyz(ego_pose["rotation"]),
+                "speed_history": [0.0],
             }
             return {
                 "ego_speed": 0.0,
@@ -129,23 +132,36 @@ class KinematicExtractor(BaseExtractor):
         prev_speed_mps = self.prev_state["speed_mps"] if self.prev_state else 0.0
         accel_mps2 = float((speed_mps - prev_speed_mps) / dt)
 
+        # ego_speed_delta: speed change over the last lookback_frames frames
+        # (~1.5 s at 2 Hz). Captures trend/sustained deceleration, distinct
+        # from the instantaneous ego_acceleration signal.
+        speed_history = self.prev_state.get("speed_history", [prev_speed_mps])
+        oldest_speed = speed_history[0]
+        speed_delta_k = float(
+            _clip((speed_mps - oldest_speed) / self.max_speed_mps, -1.0, 1.0)
+        )
+        new_history = (speed_history + [speed_mps])[-self.lookback_frames:]
+
         # Normalize per schema bounds.
         speed_norm = _clip(speed_mps / self.max_speed_mps, 0.0, 1.0)
-        prev_speed_norm = _clip(prev_speed_mps / self.max_speed_mps, 0.0, 1.0)
 
         lat_accel_mps2 = yaw_rate_radps * speed_mps
         out = {
             "ego_speed": speed_norm,
             "ego_acceleration": _clip(accel_mps2 / self.max_accel_mps2, -1.0, 1.0),
             "ego_yaw_rate": _clip(yaw_rate_radps / self.max_yaw_rate_radps, -1.0, 1.0),
-            "ego_speed_delta": speed_norm - prev_speed_norm,
+            "ego_speed_delta": speed_delta_k,
             "ego_stopped": 1.0 if speed_mps < self.stopped_speed_mps else 0.0,
             "ego_braking": 1.0 if accel_mps2 < self.braking_accel_mps2 else 0.0,
             "ego_turning": 1.0 if abs(yaw_rate_radps) > self.turning_yaw_rate_radps else 0.0,
             "lateral_acceleration": _clip(lat_accel_mps2 / self.max_accel_mps2, -1.0, 1.0),
         }
 
-        self.prev_state = {"speed_mps": speed_mps, "yaw": cur_yaw}
+        self.prev_state = {
+            "speed_mps": speed_mps,
+            "yaw": cur_yaw,
+            "speed_history": new_history,
+        }
         return out
 
 
@@ -209,6 +225,12 @@ class AgentExtractor(BaseExtractor):
 
         ego_t   = np.array(ego_pose["translation"][:3], dtype=np.float64)
         ego_R_inv = Quaternion(ego_pose["rotation"]).inverse.rotation_matrix
+        cur_yaw = _yaw_from_quaternion_wxyz(ego_pose["rotation"])
+        prev_yaw = (self.prev_state.get("ego_yaw", cur_yaw)
+                    if self.prev_state else cur_yaw)
+        # Mid-interval ego yaw for lead-vehicle projection (reduces turn error).
+        mid_yaw = prev_yaw + _wrap_pi(cur_yaw - prev_yaw) * 0.5
+        cos_m, sin_m = float(np.cos(mid_yaw)), float(np.sin(mid_yaw))
 
         def to_ego_frame(global_xyz):
             """(x_forward, y_left, z_up) in ego vehicle frame."""
@@ -243,11 +265,18 @@ class AgentExtractor(BaseExtractor):
             entry = {"ann": ann, "pos": pos, "dist": dist, "attrs": attrs}
 
             if cat.startswith("vehicle.bicycle") or cat.startswith("vehicle.motorcycle"):
-                cyclists.append(entry)
+                # Only count as a cyclist if someone is actually riding it.
+                # cycle.without_rider is a parked bike/moto on a stand — not a traffic hazard.
+                if "cycle.with_rider" in attrs:
+                    cyclists.append(entry)
             elif cat.startswith("vehicle."):
                 vehicles.append(entry)
             elif cat.startswith("human.pedestrian"):
-                pedestrians.append(entry)
+                # Construction workers are excluded from the pedestrian bucket:
+                # they're already captured by construction_zone_det and including
+                # them here would make pedestrian_ahead fire when passing a work site.
+                if not cat.startswith("human.pedestrian.construction_worker"):
+                    pedestrians.append(entry)
 
         # ── Lead vehicle ──────────────────────────────────────────────────────
         half_lane = self.lane_width_m / 2.0
@@ -263,13 +292,18 @@ class AgentExtractor(BaseExtractor):
             lead = min(lead_candidates, key=lambda v: v["pos"][0])
             inst  = lead["ann"]["instance_token"]
 
-            # Lead longitudinal velocity from instance tracking
+            # Lead longitudinal velocity from instance tracking.
+            # Project through mid-interval ego heading to reduce the O(ω·dt)
+            # rotation error that accumulates when projecting through the
+            # current-frame rotation alone on turns.
             if inst in prev_by_inst:
-                global_delta = (
-                    np.array(lead["ann"]["translation"][:3])
-                    - np.array(prev_by_inst[inst]["translation"][:3])
+                global_delta_2d = (
+                    np.array(lead["ann"]["translation"][:2])
+                    - np.array(prev_by_inst[inst]["translation"][:2])
                 )
-                lead_vel_fwd = float((ego_R_inv @ global_delta)[0] / dt)
+                lead_vel_fwd = float(
+                    (cos_m * global_delta_2d[0] + sin_m * global_delta_2d[1]) / dt
+                )
 
             # Closing rate = ego advancing faster than lead (positive → approaching)
             closing_rate = ego_speed_mps - lead_vel_fwd
@@ -349,22 +383,27 @@ class AgentExtractor(BaseExtractor):
                      - np.array(prev_by_inst[inst]["translation"][:2]))
             return float(np.linalg.norm(delta) / dt)
 
-        # Adjacent lane occupancy: only count vehicles that are actually moving
+        # Adjacent lane occupancy: moving vehicle in the lane band within ±20m.
+        # ±20m matches the schema and gives enough look-ahead/behind for lane
+        # change decisions (a vehicle 15m behind is still relevant).
         L = self.lane_width_m
         left_blocked  = any(
             _vehicle_speed(v) > 0.5
             for v in vehicles
-            if L * 0.5 < v["pos"][1] < L * 2.5 and abs(v["pos"][0]) < 10.0
+            if L * 0.5 < v["pos"][1] < L * 2.5 and abs(v["pos"][0]) < 20.0
         )
         right_blocked = any(
             _vehicle_speed(v) > 0.5
             for v in vehicles
-            if -L * 2.5 < v["pos"][1] < -L * 0.5 and abs(v["pos"][0]) < 10.0
+            if -L * 2.5 < v["pos"][1] < -L * 0.5 and abs(v["pos"][0]) < 20.0
         )
 
-        # Parked cars: stationary vehicles in side bands within ±15m along x
+        # Parked cars: vehicles with the explicit vehicle.parked attribute in
+        # side bands within ±15m. Using the annotation attribute is more
+        # reliable than speed-derived heuristics: speed==0 on frame 0 (no prev)
+        # and vehicle.stopped (e.g., at a red light) would otherwise misfire.
         parked = any(
-            _vehicle_speed(v) < 0.5
+            "vehicle.parked" in v["attrs"]
             for v in vehicles
             if abs(v["pos"][1]) > L * 0.5 and abs(v["pos"][0]) < 15.0
         )
@@ -452,11 +491,34 @@ class AgentExtractor(BaseExtractor):
         lane_count = 1
         if nusc_map is not None:
             try:
+                from nuscenes.map_expansion import arcline_path_utils as _apu
                 nearby_lanes = nusc_map.get_records_in_radius(
                     float(ego_t[0]), float(ego_t[1]),
                     self.lane_count_radius_m, ["lane"]
                 )["lane"]
-                lane_count = max(1, len(nearby_lanes))
+                # Keep only lanes whose heading aligns with ego forward.
+                # On a divided road the 10 m radius catches both directions;
+                # without this filter the count doubles and halves per-lane density.
+                ego_yaw = _yaw_from_quaternion_wxyz(ego_pose["rotation"])
+                ego_fwd = np.array([np.cos(ego_yaw), np.sin(ego_yaw)])
+                same_dir = 0
+                for lt in nearby_lanes:
+                    arcline = nusc_map.arcline_path_3.get(lt)
+                    if arcline is None:
+                        same_dir += 1  # can't tell; include
+                        continue
+                    try:
+                        poses = _apu.discretize_lane(arcline, resolution_meters=2.0)
+                        if not poses:
+                            same_dir += 1
+                            continue
+                        lane_yaw = poses[0][2]
+                        lane_fwd = np.array([np.cos(lane_yaw), np.sin(lane_yaw)])
+                        if float(lane_fwd @ ego_fwd) > 0:
+                            same_dir += 1
+                    except Exception:
+                        same_dir += 1
+                lane_count = max(1, same_dir)
             except Exception:
                 lane_count = 1
 
@@ -488,6 +550,7 @@ class AgentExtractor(BaseExtractor):
             "timestamp":    ego_pose["timestamp"],
             "ego_t":        ego_t.copy(),
             "lead_vel_fwd": lead_vel_fwd,
+            "ego_yaw":      cur_yaw,
         }
 
         return {**out_lead, **out_ped, **out_misc}
@@ -563,11 +626,15 @@ class InfrastructureExtractor(BaseExtractor):
         in_carpark     = 1.0 if layers.get("carpark_area") else 0.0
 
         # ── distance_to_intersection ──────────────────────────────────────────
-        # Search nearby road_segments and walkways for the closest intersection
-        # whose centroid lies in the forward half-plane (forward · rel > 0).
+        # Distance to the nearest boundary vertex of each forward intersection.
+        # Using the nearest forward boundary vertex rather than the centroid
+        # gives a better "distance to entering the intersection" estimate for
+        # elongated or T-junction polygons where the centroid can be well past
+        # the entrance line.
         nearby = nusc_map.get_records_in_radius(
             x, y, self.max_intersection_distance_m, ["road_segment"]
         )["road_segment"]
+        ego_arr = np.array([x, y])
         min_fwd_dist = float("inf")
         for tok in nearby:
             rs = nusc_map.get("road_segment", tok)
@@ -575,15 +642,16 @@ class InfrastructureExtractor(BaseExtractor):
                 continue
             try:
                 poly = nusc_map.extract_polygon(rs["polygon_token"])
-                cx, cy = poly.centroid.x, poly.centroid.y
             except Exception:
                 continue
-            rel = np.array([cx - x, cy - y])
-            d = float(np.linalg.norm(rel))
-            if d < 1e-3:
+            fwd_verts = [
+                np.array([bx, by])
+                for bx, by in poly.exterior.coords
+                if float((np.array([bx, by]) - ego_arr) @ forward) > 0
+            ]
+            if not fwd_verts:
                 continue
-            if float(rel @ forward) <= 0:
-                continue
+            d = float(min(np.linalg.norm(pt - ego_arr) for pt in fwd_verts))
             if d < min_fwd_dist:
                 min_fwd_dist = d
 
@@ -622,13 +690,25 @@ class InfrastructureExtractor(BaseExtractor):
             )
 
         # ── traffic_light_location_ahead ─────────────────────────────────────
-        # Binary: any traffic_light record within max_traffic_light_distance_m.
+        # Binary: any traffic_light whose polygon centroid is within
+        # max_traffic_light_distance_m AND in the forward half-plane.
         # nuScenes traffic_light layer encodes location only, no signal state.
         try:
             nearby_tls = nusc_map.get_records_in_radius(
                 x, y, self.max_traffic_light_distance_m, ["traffic_light"]
             )["traffic_light"]
-            tl_location_ahead = 1.0 if nearby_tls else 0.0
+            tl_location_ahead = 0.0
+            for tl_tok in nearby_tls:
+                tl_rec = nusc_map.get("traffic_light", tl_tok)
+                try:
+                    poly = nusc_map.extract_polygon(tl_rec["polygon_token"])
+                    cx, cy = poly.centroid.x, poly.centroid.y
+                except Exception:
+                    continue
+                rel = np.array([cx - x, cy - y])
+                if float(rel @ forward) > 0:
+                    tl_location_ahead = 1.0
+                    break
         except Exception:
             # Some map locations may not include the traffic_light layer.
             tl_location_ahead = 0.0
