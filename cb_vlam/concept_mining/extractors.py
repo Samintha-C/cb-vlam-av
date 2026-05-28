@@ -311,7 +311,12 @@ class AgentExtractor(BaseExtractor):
             p for p in pedestrians
             if 0 < p["pos"][0] < 10.0 and abs(p["pos"][1]) < 4.0
         ]
-        nearest_ped_dist = min((p["dist"] for p in pedestrians), default=None)
+        # Forward-only filter for "presence" semantics — matches what the front
+        # camera sees. nuScenes annotations are 360° around ego; we exclude
+        # anything behind so the concept stays consistent with a forward
+        # visual check.
+        peds_fwd = [p for p in pedestrians if p["pos"][0] > 0]
+        nearest_ped_dist = min((p["dist"] for p in peds_fwd), default=None)
 
         out_ped = {
             "pedestrian_ahead": 1.0 if peds_crosswalk else 0.0,
@@ -321,7 +326,10 @@ class AgentExtractor(BaseExtractor):
 
         # ── Nearby vehicles & cyclists ────────────────────────────────────────
         nearby_count = sum(1 for v in vehicles if v["dist"] < self.nearby_vehicle_range_m)
-        cyc_close    = any(c["dist"] < self.pedestrian_check_range_m for c in cyclists)
+        cyc_close    = any(
+            c["pos"][0] > 0 and c["dist"] < self.pedestrian_check_range_m
+            for c in cyclists
+        )
 
         # Per-vehicle planar speed via instance tracking — needed for moving/parked checks
         def _vehicle_speed(v) -> float:
@@ -356,8 +364,11 @@ class AgentExtractor(BaseExtractor):
         # All use a 30m radius (class_presence_radius_m). Iterate annotations
         # once per class rather than reusing the vehicle/ped/cyclist buckets,
         # which filtered out movable_object.* and animal.* categories.
-        def _ann_ego_dist(a):
-            return float(np.linalg.norm(to_ego_frame(a["translation"])[:2]))
+        # Returns (forward_x, planar_distance) so callers can apply a
+        # front-half-plane filter where the semantic calls for it.
+        def _ann_ego_xd(a):
+            pos = to_ego_frame(a["translation"])
+            return float(pos[0]), float(np.linalg.norm(pos[:2]))
 
         R = self.class_presence_radius_m
         construction_prefixes = (
@@ -366,27 +377,36 @@ class AgentExtractor(BaseExtractor):
             "human.pedestrian.construction_worker",
             "vehicle.construction",
         )
+        # Emergency vehicles: 360° — sirens/lights matter from any direction.
         emergency_present = any(
-            a["category_name"].startswith("vehicle.emergency.") and _ann_ego_dist(a) < R
+            a["category_name"].startswith("vehicle.emergency.") and _ann_ego_xd(a)[1] < R
             for a in annotations
         )
+        # Construction zone: 360° — area-level signal; barriers behind also indicate a zone.
         construction_present = any(
-            a["category_name"].startswith(construction_prefixes) and _ann_ego_dist(a) < R
+            a["category_name"].startswith(construction_prefixes) and _ann_ego_xd(a)[1] < R
             for a in annotations
         )
-        animal_or_debris = any(
-            (a["category_name"].startswith("animal")
-             or a["category_name"].startswith("movable_object.debris"))
-            and _ann_ego_dist(a) < R
-            for a in annotations
-        )
+        # Animal or debris on road: forward-only — hazards on the ego's path.
+        animal_or_debris = False
+        for a in annotations:
+            if not (a["category_name"].startswith("animal")
+                    or a["category_name"].startswith("movable_object.debris")):
+                continue
+            x_fwd, d = _ann_ego_xd(a)
+            if x_fwd > 0 and d < R:
+                animal_or_debris = True
+                break
 
         # ── Pedestrian intent crossing ───────────────────────────────────────
-        # A pedestrian with pedestrian.moving attribute, within 15m of ego AND
-        # within 5m of a ped_crossing polygon, signals likely crossing intent.
+        # A pedestrian with pedestrian.moving attribute, within 15m AHEAD of
+        # ego AND within 5m of a ped_crossing polygon, signals likely
+        # crossing intent into the ego's path.
         ped_intent = 0.0
         if nusc_map is not None:
             for ped in pedestrians:
+                if ped["pos"][0] <= 0:  # behind ego
+                    continue
                 if ped["dist"] > self.ped_intent_radius_m:
                     continue
                 if "pedestrian.moving" not in ped["ann"].get("attribute_names", []):
@@ -404,8 +424,11 @@ class AgentExtractor(BaseExtractor):
                     break
 
         # ── Pedestrian density ───────────────────────────────────────────────
+        # Forward-only: density of peds the ego is approaching, not all
+        # pedestrians in a 360° ring (which over-counts crowds behind ego).
         ped_count_nearby = sum(
-            1 for p in pedestrians if p["dist"] < self.class_presence_radius_m
+            1 for p in pedestrians
+            if p["pos"][0] > 0 and p["dist"] < self.class_presence_radius_m
         )
         ped_density_norm = float(np.clip(
             ped_count_nearby / self.ped_density_max_count, 0.0, 1.0
