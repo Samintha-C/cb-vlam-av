@@ -419,8 +419,11 @@ class AgentExtractor(BaseExtractor):
             return float(pos[0]), float(np.linalg.norm(pos[:2]))
 
         R = self.class_presence_radius_m
+        # movable_object.barrier is excluded: in nuScenes Boston-seaport, jersey
+        # barriers along road dividers are annotated as barriers — they are
+        # permanent infrastructure, not construction zones. Cones + workers +
+        # construction vehicles are sufficiently specific to active work zones.
         construction_prefixes = (
-            "movable_object.barrier",
             "movable_object.trafficcone",
             "human.pedestrian.construction_worker",
             "vehicle.construction",
@@ -761,28 +764,35 @@ class InfrastructureExtractor(BaseExtractor):
                         radius=self.lane_search_radius_m,
                     )
 
-                    def _is_same_direction(probe_tok: str) -> bool:
+                    def _is_same_direction(probe_tok: str,
+                                           probe_xy: np.ndarray) -> bool:
                         """True iff probe lane exists, differs from current, and
                         heads within 45° of the current lane (cos > 0.7).
                         Rejects opposing lanes (cos ≈ -1) and cross-street /
-                        intersection lanes (cos ≈ 0) that are positionally close
-                        but not actual same-direction lane-change targets."""
+                        intersection lanes (cos ≈ 0).
+                        Uses the heading at the pose nearest to probe_xy, not
+                        pose[0], so curved roads don't produce misleading
+                        start-of-lane headings."""
                         if not probe_tok or probe_tok == current_lane_token:
                             return False
                         arc = nusc_map.arcline_path_3.get(probe_tok)
                         if arc is None:
                             return False
                         probe_poses = arcline_path_utils.discretize_lane(
-                            arc, resolution_meters=2.0
+                            arc, resolution_meters=1.0
                         )
                         if not probe_poses:
                             return False
-                        probe_yaw = probe_poses[0][2]
+                        poses_xy = np.array([(p[0], p[1]) for p in probe_poses])
+                        nearest = int(np.argmin(
+                            np.linalg.norm(poses_xy - probe_xy, axis=1)
+                        ))
+                        probe_yaw = probe_poses[nearest][2]
                         return float(np.cos(probe_yaw - lane_yaw)) > 0.7
 
-                    if _is_same_direction(left_tok):
+                    if _is_same_direction(left_tok, probe_left):
                         lane_left = 1.0
-                    if _is_same_direction(right_tok):
+                    if _is_same_direction(right_tok, probe_right):
                         lane_right = 1.0
 
         return {
