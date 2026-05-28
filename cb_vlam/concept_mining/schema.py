@@ -27,7 +27,7 @@ PASS_B_AGENT_CONCEPTS: List[Dict] = [
     {"name": "lead_vehicle_decelerating", "type": "binary", "desc": "1.0 if lead vehicle's acceleration < -1 m/s^2"},
     {"name": "pedestrian_ahead", "type": "binary", "desc": "1.0 if any pedestrian is within 10m ahead of ego in the forward corridor (±4m lateral)"},
     {"name": "nearest_pedestrian_distance", "type": "float", "desc": "Distance to nearest pedestrian ahead of ego (m), normalized [0, 1] over [0, 30]. 1.0 if none ahead."},
-    {"name": "vehicle_count_nearby", "type": "float", "desc": "Number of vehicles within 30m (any direction), normalized [0, 1] over [0, 10]"},
+    {"name": "vehicle_count_nearby", "type": "float", "desc": "Number of moving (non-parked) vehicles within 30m (any direction), normalized [0, 1] over [0, 10]"},
     {"name": "cyclist_present", "type": "binary", "desc": "1.0 if any cyclist is within 20m AHEAD of ego"},
     {"name": "left_lane_blocked", "type": "binary", "desc": "1.0 if a moving vehicle (|v|>0.5 m/s) occupies the immediately adjacent left lane within ±20m"},
     {"name": "right_lane_blocked", "type": "binary", "desc": "1.0 if a moving vehicle (|v|>0.5 m/s) occupies the immediately adjacent right lane within ±20m"},
@@ -39,7 +39,7 @@ PASS_B_AGENT_CONCEPTS: List[Dict] = [
     {"name": "animal_or_debris_on_road_det", "type": "binary", "desc": "1.0 if any animal or movable_object.debris annotation within 30m AHEAD of ego"},
     {"name": "pedestrian_intent_crossing_det", "type": "binary", "desc": "1.0 if any pedestrian AHEAD of ego with pedestrian.moving attribute is within 15m and within 5m of a ped_crossing polygon"},
     {"name": "pedestrian_density", "type": "float", "desc": "Count of pedestrians within 30m AHEAD of ego, normalized [0, 1] over [0, 5]"},
-    {"name": "traffic_density_det", "type": "categorical", "values": ["light", "moderate", "heavy"], "desc": "Discretized vehicle_count_nearby: light=0-2, moderate=3-5, heavy=6+"},
+    {"name": "traffic_density_det", "type": "categorical", "values": ["light", "moderate", "heavy"], "desc": "Per-lane traffic density: moving vehicles within 30m divided by lane count near ego (HD-map lane layer in 10m radius). light=<1.0 v/lane, moderate=<2.0, heavy=>=2.0"},
     {"name": "time_to_collision_lead", "type": "float", "desc": "Lead distance / closing rate (s), clipped to [0, 1] over [0, 10]. 1.0 if no lead or not closing."},
     {"name": "following_distance_seconds", "type": "float", "desc": "Lead distance / ego speed (s), clipped to [0, 1] over [0, 5]. 1.0 if no lead or ego stopped."},
 ]

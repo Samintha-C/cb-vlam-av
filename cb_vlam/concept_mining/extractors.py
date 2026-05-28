@@ -171,7 +171,8 @@ class AgentExtractor(BaseExtractor):
                  ped_intent_crosswalk_radius_m: float = 5.0,
                  ttc_max_seconds: float = 10.0,
                  following_max_seconds: float = 5.0,
-                 ped_density_max_count: float = 5.0):
+                 ped_density_max_count: float = 5.0,
+                 lane_count_radius_m: float = 10.0):
         super().__init__()
         self.lead_vehicle_max_distance_m = lead_vehicle_max_distance_m
         self.nearby_vehicle_range_m = nearby_vehicle_range_m
@@ -183,6 +184,7 @@ class AgentExtractor(BaseExtractor):
         self.ttc_max_seconds = ttc_max_seconds
         self.following_max_seconds = following_max_seconds
         self.ped_density_max_count = ped_density_max_count
+        self.lane_count_radius_m = lane_count_radius_m
 
     def extract(self,
                 ego_pose: Dict[str, Any],
@@ -237,7 +239,8 @@ class AgentExtractor(BaseExtractor):
             cat = ann["category_name"]
             pos = to_ego_frame(ann["translation"])
             dist = float(np.linalg.norm(pos[:2]))
-            entry = {"ann": ann, "pos": pos, "dist": dist}
+            attrs = ann.get("attribute_names", [])
+            entry = {"ann": ann, "pos": pos, "dist": dist, "attrs": attrs}
 
             if cat.startswith("vehicle.bicycle") or cat.startswith("vehicle.motorcycle"):
                 cyclists.append(entry)
@@ -325,7 +328,13 @@ class AgentExtractor(BaseExtractor):
         }
 
         # ── Nearby vehicles & cyclists ────────────────────────────────────────
-        nearby_count = sum(1 for v in vehicles if v["dist"] < self.nearby_vehicle_range_m)
+        # Exclude parked vehicles: a permanently-parked car on the curb isn't
+        # "traffic". (vehicle.stopped — e.g., a car at a red light — still counts.)
+        nearby_count = sum(
+            1 for v in vehicles
+            if v["dist"] < self.nearby_vehicle_range_m
+            and "vehicle.parked" not in v["attrs"]
+        )
         cyc_close    = any(
             c["pos"][0] > 0 and c["dist"] < self.pedestrian_check_range_m
             for c in cyclists
@@ -434,11 +443,28 @@ class AgentExtractor(BaseExtractor):
             ped_count_nearby / self.ped_density_max_count, 0.0, 1.0
         ))
 
-        # ── Traffic density (categorical, encoded as float index) ────────────
-        # 0=light (0-2 vehicles), 1=moderate (3-5), 2=heavy (6+)
-        if nearby_count >= 6:
+        # ── Traffic density (per-lane, categorical encoded as float index) ────
+        # Normalize moving-vehicle count by the number of lanes near ego so
+        # the signal is comparable across a one-lane residential street and a
+        # multi-lane arterial. lane_count uses the HD-map `lane` layer; a
+        # single drivable lane intersects only itself within a small radius,
+        # while a wide road intersects all parallel lanes.
+        lane_count = 1
+        if nusc_map is not None:
+            try:
+                nearby_lanes = nusc_map.get_records_in_radius(
+                    float(ego_t[0]), float(ego_t[1]),
+                    self.lane_count_radius_m, ["lane"]
+                )["lane"]
+                lane_count = max(1, len(nearby_lanes))
+            except Exception:
+                lane_count = 1
+
+        vehicles_per_lane = nearby_count / lane_count
+        # 0=light (<1.0 v/lane), 1=moderate (<2.0), 2=heavy (>=2.0)
+        if vehicles_per_lane >= 2.0:
             traffic_dens_idx = 2.0
-        elif nearby_count >= 3:
+        elif vehicles_per_lane >= 1.0:
             traffic_dens_idx = 1.0
         else:
             traffic_dens_idx = 0.0
