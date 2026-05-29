@@ -424,7 +424,7 @@ class AgentExtractor(BaseExtractor):
             a["category_name"].startswith("vehicle.emergency.") and _ann_ego_xd(a)[1] < R
             for a in annotations
         )
-        # Construction zone: weighted evidence score, threshold ≥ 3.
+        # Construction zone: weighted evidence score, threshold ≥ 5.
         #   cone=1, barrier=2, construction_worker=3, construction_vehicle=3
         # Rationale: single cone or bare barrier is insufficient; co-occurrence
         # or cluster size is required. Barriers re-admitted here (excluded from
@@ -443,7 +443,7 @@ class AgentExtractor(BaseExtractor):
                 _cz_score += 3
             elif cat.startswith("vehicle.construction"):
                 _cz_score += 3
-        construction_present = _cz_score >= 3
+        construction_present = _cz_score >= 5
         # Animal or debris on road: forward-only — hazards on the ego's path.
         animal_or_debris = False
         for a in annotations:

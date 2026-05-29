@@ -133,9 +133,9 @@ def debug_sample(nusc, sample_token: str) -> None:
                 f"ang={r['angle']:+6.1f}°  [{_fov_tag(r['x_fwd'], r['angle'])}]")
 
     cz_score = sum(r["weight"] for r in construction)
-    cz_fires = cz_score >= 3
+    cz_fires = cz_score >= 5
     print(f"\n[construction_zone_det] would fire = {cz_fires}  "
-          f"(score={cz_score}/3, {len(construction)} annotation(s) in 30 m 360° band)")
+          f"(score={cz_score}/5, {len(construction)} annotation(s) in 30 m 360° band)")
     fov_hits = sum(1 for r in construction if r["x_fwd"] > 0
                    and abs(r["angle"]) < FRONT_CAM_HALF_FOV_DEG)
     if construction:
