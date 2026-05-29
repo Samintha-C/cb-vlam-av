@@ -419,25 +419,31 @@ class AgentExtractor(BaseExtractor):
             return float(pos[0]), float(np.linalg.norm(pos[:2]))
 
         R = self.class_presence_radius_m
-        # movable_object.barrier is excluded: in nuScenes Boston-seaport, jersey
-        # barriers along road dividers are annotated as barriers — they are
-        # permanent infrastructure, not construction zones. Cones + workers +
-        # construction vehicles are sufficiently specific to active work zones.
-        construction_prefixes = (
-            "movable_object.trafficcone",
-            "human.pedestrian.construction_worker",
-            "vehicle.construction",
-        )
         # Emergency vehicles: 360° — sirens/lights matter from any direction.
         emergency_present = any(
             a["category_name"].startswith("vehicle.emergency.") and _ann_ego_xd(a)[1] < R
             for a in annotations
         )
-        # Construction zone: 360° — area-level signal; barriers behind also indicate a zone.
-        construction_present = any(
-            a["category_name"].startswith(construction_prefixes) and _ann_ego_xd(a)[1] < R
-            for a in annotations
-        )
+        # Construction zone: weighted evidence score, threshold ≥ 3.
+        #   cone=1, barrier=2, construction_worker=3, construction_vehicle=3
+        # Rationale: single cone or bare barrier is insufficient; co-occurrence
+        # or cluster size is required. Barriers re-admitted here (excluded from
+        # the plain boolean check before) because barrier+cone co-occurrence is
+        # a strong active-work signal.
+        _cz_score = 0
+        for a in annotations:
+            cat = a["category_name"]
+            if _ann_ego_xd(a)[1] >= R:
+                continue
+            if cat.startswith("movable_object.trafficcone"):
+                _cz_score += 1
+            elif cat.startswith("movable_object.barrier"):
+                _cz_score += 2
+            elif cat.startswith("human.pedestrian.construction_worker"):
+                _cz_score += 3
+            elif cat.startswith("vehicle.construction"):
+                _cz_score += 3
+        construction_present = _cz_score >= 3
         # Animal or debris on road: forward-only — hazards on the ego's path.
         animal_or_debris = False
         for a in annotations:

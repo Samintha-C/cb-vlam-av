@@ -28,11 +28,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 from pyquaternion import Quaternion
 
-CONSTRUCTION_PREFIXES = (
-    "movable_object.trafficcone",
-    "human.pedestrian.construction_worker",
-    "vehicle.construction",
-)
+# Weights mirror extractors.py: cone=1, barrier=2, worker=3, vehicle=3, threshold=3
+CONSTRUCTION_WEIGHTS = {
+    "movable_object.trafficcone": 1,
+    "movable_object.barrier": 2,
+    "human.pedestrian.construction_worker": 3,
+    "vehicle.construction": 3,
+}
 
 # nuScenes CAM_FRONT has a ~70° horizontal FOV (≈35° each side of centerline).
 FRONT_CAM_HALF_FOV_DEG = 35.0
@@ -107,8 +109,10 @@ def debug_sample(nusc, sample_token: str) -> None:
         rec = dict(cat=cat, attrs=attrs, dist=dist,
                    x_fwd=x_fwd, y_lat=y_lat, angle=angle)
 
-        if cat.startswith(CONSTRUCTION_PREFIXES) and dist < 30.0:
-            construction.append(rec)
+        for prefix, weight in CONSTRUCTION_WEIGHTS.items():
+            if cat.startswith(prefix) and dist < 30.0:
+                construction.append({**rec, "weight": weight})
+                break
 
         if (cat.startswith("human.pedestrian")
                 and not cat.startswith("human.pedestrian.construction_worker")
@@ -123,12 +127,15 @@ def debug_sample(nusc, sample_token: str) -> None:
             vehicles_moving.append(rec)
 
     def _row(r):
-        return (f"  {r['cat']:48s}  d={r['dist']:5.1f}m  "
+        w = f"  (w={r['weight']})" if "weight" in r else ""
+        return (f"  {r['cat']:48s}{w}  d={r['dist']:5.1f}m  "
                 f"x_fwd={r['x_fwd']:+6.1f}  y_lat={r['y_lat']:+6.1f}  "
                 f"ang={r['angle']:+6.1f}°  [{_fov_tag(r['x_fwd'], r['angle'])}]")
 
-    print(f"\n[construction_zone_det] would fire = {bool(construction)}  "
-          f"({len(construction)} annotation(s) in 30 m 360° band)")
+    cz_score = sum(r["weight"] for r in construction)
+    cz_fires = cz_score >= 3
+    print(f"\n[construction_zone_det] would fire = {cz_fires}  "
+          f"(score={cz_score}/3, {len(construction)} annotation(s) in 30 m 360° band)")
     fov_hits = sum(1 for r in construction if r["x_fwd"] > 0
                    and abs(r["angle"]) < FRONT_CAM_HALF_FOV_DEG)
     if construction:
