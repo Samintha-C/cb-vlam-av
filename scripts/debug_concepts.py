@@ -179,7 +179,11 @@ def main() -> None:
             debug_sample(nusc, sample_token)
     else:
         for prefix in (t.strip() for t in args.tokens.split(",") if t.strip()):
-            kind, full = _resolve_prefix(nusc, prefix)
+            try:
+                kind, full = _resolve_prefix(nusc, prefix)
+            except ValueError as e:
+                print(f"\n# SKIP {prefix!r}: {e}")
+                continue
             if kind == "scene":
                 sample_token = _middle_sample_of_scene(nusc, full)
                 print(f"\n# prefix {prefix!r} → scene {full}, middle sample")
