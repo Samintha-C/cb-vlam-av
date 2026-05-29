@@ -4,7 +4,7 @@ This is the single source of truth for which concepts the pipeline produces.
 Extractors should write only these keys; the model expects only these keys.
 """
 
-from typing import Dict, List
+from typing import Dict, Iterable, List
 
 # Each concept is described by (name, type, description).
 # Types: "float" (continuous), "binary" (0.0 or 1.0), "categorical" (integer index)
@@ -101,19 +101,42 @@ PASS_C_SCENE_CONCEPTS: List[Dict] = [
 ]
 
 
-def get_all_concepts() -> List[Dict]:
-    """Return all concept definitions in canonical order."""
-    return (
-        PASS_A_CONCEPTS
-        + PASS_B_AGENT_CONCEPTS
-        + PASS_B_INFRA_CONCEPTS
-        + PASS_C_SCENE_CONCEPTS
-    )
+# Canonical pass identifiers, used by get_all_concepts(passes=...).
+_PASS_BLOCKS = {
+    "A": PASS_A_CONCEPTS,
+    "B": PASS_B_AGENT_CONCEPTS + PASS_B_INFRA_CONCEPTS,
+    "C": PASS_C_SCENE_CONCEPTS,
+}
+
+DEFAULT_PASSES = ("A", "B", "C")
 
 
-def get_concept_keys() -> List[str]:
-    """Return list of concept names in canonical order."""
-    return [c["name"] for c in get_all_concepts()]
+def get_all_concepts(passes: Iterable[str] = DEFAULT_PASSES) -> List[Dict]:
+    """Return concept definitions for the requested passes in canonical order.
+
+    Args:
+        passes: Iterable of pass identifiers from {"A", "B", "C"}. Order of the
+            returned list always follows A → B → C regardless of the order
+            given. Defaults to all three passes.
+
+    The canonical concatenation order (A, then B-agent + B-infra, then C) is
+    preserved so concept vector indices stay stable as long as the same set of
+    passes is requested.
+    """
+    sel = {p.upper() for p in passes}
+    invalid = sel - set(_PASS_BLOCKS)
+    if invalid:
+        raise ValueError(f"Unknown pass(es): {sorted(invalid)}. Valid: A, B, C.")
+    out: List[Dict] = []
+    for p in ("A", "B", "C"):
+        if p in sel:
+            out.extend(_PASS_BLOCKS[p])
+    return out
+
+
+def get_concept_keys(passes: Iterable[str] = DEFAULT_PASSES) -> List[str]:
+    """Return list of concept names in canonical order for the given passes."""
+    return [c["name"] for c in get_all_concepts(passes)]
 
 
 CONCEPT_KEYS: List[str] = get_concept_keys()
