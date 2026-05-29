@@ -35,7 +35,7 @@ PASS_B_AGENT_CONCEPTS: List[Dict] = [
     # ── Deterministic annotation-based concepts (suffix _det disambiguates
     # from VLM versions of the same concept in Pass C).
     {"name": "emergency_vehicle_present_det", "type": "binary", "desc": "1.0 if any vehicle.emergency.* annotation within 30m (ambulance/police/fire)"},
-    {"name": "construction_zone_det", "type": "binary", "desc": "1.0 if any construction-class object within 30m (movable_object.barrier ∪ movable_object.trafficcone ∪ human.pedestrian.construction_worker ∪ vehicle.construction)"},
+    {"name": "construction_zone_det", "type": "binary", "desc": "1.0 if construction evidence ahead within 30m (forward half-plane). Weighted: cone=1, worker=3, construction_vehicle=3 (primary); barrier=1 (support). Fires iff primary>=1 and primary+support>=5 — barriers corroborate but cannot trigger alone (permanent road dividers are densely annotated in nuScenes)."},
     {"name": "animal_or_debris_on_road_det", "type": "binary", "desc": "1.0 if any animal or movable_object.debris annotation within 30m AHEAD of ego"},
     {"name": "pedestrian_intent_crossing_det", "type": "binary", "desc": "1.0 if any pedestrian AHEAD of ego with pedestrian.moving attribute is within 15m and within 5m of a ped_crossing polygon"},
     {"name": "pedestrian_density", "type": "float", "desc": "Count of pedestrians within 30m AHEAD of ego, normalized [0, 1] over [0, 5]"},
@@ -49,7 +49,8 @@ PASS_B_INFRA_CONCEPTS: List[Dict] = [
     {"name": "distance_to_intersection", "type": "float", "desc": "Distance to next intersection (m), normalized [0, 1] over [0, 100]"},
     {"name": "lane_available_left", "type": "binary", "desc": "1.0 if a left lane exists on the current road"},
     {"name": "lane_available_right", "type": "binary", "desc": "1.0 if a right lane exists on the current road"},
-    {"name": "speed_limit_normalized", "type": "float", "desc": "Speed limit on current segment (m/s), normalized [0, 1] over [0, 35]"},
+    # NOTE: speed_limit_normalized was removed — nuScenes HD maps do not encode
+    # speed limits, so the deterministic value was a constant 0.0 (dead signal).
     {"name": "road_curvature_ahead", "type": "float", "desc": "Curvature of the lane centerline 30m ahead (1/m), normalized [-1, 1] over [-0.05, 0.05]"},
     {"name": "in_intersection", "type": "binary", "desc": "1.0 if ego is currently inside an intersection polygon"},
     # ── Deterministic map-layer concepts.

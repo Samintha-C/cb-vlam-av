@@ -424,26 +424,34 @@ class AgentExtractor(BaseExtractor):
             a["category_name"].startswith("vehicle.emergency.") and _ann_ego_xd(a)[1] < R
             for a in annotations
         )
-        # Construction zone: weighted evidence score, threshold ≥ 5.
-        #   cone=1, barrier=2, construction_worker=3, construction_vehicle=3
-        # Rationale: single cone or bare barrier is insufficient; co-occurrence
-        # or cluster size is required. Barriers re-admitted here (excluded from
-        # the plain boolean check before) because barrier+cone co-occurrence is
-        # a strong active-work signal.
-        _cz_score = 0
+        # Construction zone: forward-half-plane weighted evidence.
+        #   PRIMARY (active-work markers): cone=1, worker=3, construction_veh=3
+        #   SUPPORT (corroborating only):  barrier=1
+        # Fires iff there is >=1 unit of primary evidence AND
+        # primary+support >= 5. Two structural guards prevent the false
+        # positives that a plain 360° weighted sum produced:
+        #   (1) Forward half-plane only (x_fwd > 0): construction behind the ego
+        #       (medians/fences already passed) doesn't affect the trajectory.
+        #   (2) Primary-evidence gate: nuScenes annotates permanent barriers
+        #       (road dividers/fences) densely, so a wall of barriers alone is
+        #       infrastructure, not construction — barriers can corroborate but
+        #       never trigger on their own.
+        _cz_primary = 0
+        _cz_support = 0
         for a in annotations:
-            cat = a["category_name"]
-            if _ann_ego_xd(a)[1] >= R:
+            x_fwd, d = _ann_ego_xd(a)
+            if d >= R or x_fwd <= 0:
                 continue
+            cat = a["category_name"]
             if cat.startswith("movable_object.trafficcone"):
-                _cz_score += 1
-            elif cat.startswith("movable_object.barrier"):
-                _cz_score += 2
+                _cz_primary += 1
             elif cat.startswith("human.pedestrian.construction_worker"):
-                _cz_score += 3
+                _cz_primary += 3
             elif cat.startswith("vehicle.construction"):
-                _cz_score += 3
-        construction_present = _cz_score >= 5
+                _cz_primary += 3
+            elif cat.startswith("movable_object.barrier"):
+                _cz_support += 1
+        construction_present = _cz_primary >= 1 and (_cz_primary + _cz_support) >= 5
         # Animal or debris on road: forward-only — hazards on the ego's path.
         animal_or_debris = False
         for a in annotations:
@@ -573,10 +581,6 @@ class InfrastructureExtractor(BaseExtractor):
     - Distance to the next intersection along the forward direction
     - Whether adjacent left/right lanes exist on the current road
     - Curvature of the lane centerline `lookahead_m` ahead
-
-    `speed_limit_normalized` is always 0.0: nuScenes HD maps do not encode
-    speed limits. The Pass C VLM produces `speed_limit_sign` separately and
-    can supply a noisy version of this signal.
     """
 
     def __init__(self,
@@ -699,9 +703,11 @@ class InfrastructureExtractor(BaseExtractor):
             )
 
         # ── traffic_light_location_ahead ─────────────────────────────────────
-        # Binary: any traffic_light whose polygon centroid is within
-        # max_traffic_light_distance_m AND in the forward half-plane.
-        # nuScenes traffic_light layer encodes location only, no signal state.
+        # Binary: any traffic_light within max_traffic_light_distance_m AND in
+        # the forward half-plane. nuScenes encodes traffic_light as a LINE layer
+        # (non_geometric_line_layers), so its records carry a `line_token`, not a
+        # `polygon_token` — use extract_line and take the line's midpoint as the
+        # reference location. (Location only; signal state is VLM-only.)
         try:
             nearby_tls = nusc_map.get_records_in_radius(
                 x, y, self.max_traffic_light_distance_m, ["traffic_light"]
@@ -710,8 +716,10 @@ class InfrastructureExtractor(BaseExtractor):
             for tl_tok in nearby_tls:
                 tl_rec = nusc_map.get("traffic_light", tl_tok)
                 try:
-                    poly = nusc_map.extract_polygon(tl_rec["polygon_token"])
-                    cx, cy = poly.centroid.x, poly.centroid.y
+                    line = nusc_map.extract_line(tl_rec["line_token"])
+                    if line.is_empty:
+                        continue
+                    cx, cy = line.centroid.x, line.centroid.y
                 except Exception:
                     continue
                 rel = np.array([cx - x, cy - y])
@@ -806,9 +814,6 @@ class InfrastructureExtractor(BaseExtractor):
             "distance_to_intersection": dist_norm,
             "lane_available_left":      lane_left,
             "lane_available_right":     lane_right,
-            # nuScenes maps have no speed-limit field; left at 0.0 (Pass C
-            # `speed_limit_sign` covers this from the front-camera image).
-            "speed_limit_normalized":   0.0,
             "road_curvature_ahead":     curvature_norm,
             "in_intersection":          in_intersection,
             "over_stop_line":               over_stop_line,

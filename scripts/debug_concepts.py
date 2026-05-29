@@ -28,12 +28,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 from pyquaternion import Quaternion
 
-# Weights mirror extractors.py: cone=1, barrier=2, worker=3, vehicle=3, threshold=3
-CONSTRUCTION_WEIGHTS = {
+# Mirrors extractors.py construction_zone_det: forward-half-plane (x_fwd > 0)
+# weighted evidence. PRIMARY = active-work markers, SUPPORT = corroborating only.
+# Fires iff primary >= 1 AND primary + support >= 5.
+CONSTRUCTION_PRIMARY_WEIGHTS = {
     "movable_object.trafficcone": 1,
-    "movable_object.barrier": 2,
     "human.pedestrian.construction_worker": 3,
     "vehicle.construction": 3,
+}
+CONSTRUCTION_SUPPORT_WEIGHTS = {
+    "movable_object.barrier": 1,
 }
 
 # nuScenes CAM_FRONT has a ~70° horizontal FOV (≈35° each side of centerline).
@@ -109,10 +113,17 @@ def debug_sample(nusc, sample_token: str) -> None:
         rec = dict(cat=cat, attrs=attrs, dist=dist,
                    x_fwd=x_fwd, y_lat=y_lat, angle=angle)
 
-        for prefix, weight in CONSTRUCTION_WEIGHTS.items():
-            if cat.startswith(prefix) and dist < 30.0:
-                construction.append({**rec, "weight": weight})
-                break
+        # Forward half-plane only (x_fwd > 0), matching extractors.py.
+        if x_fwd > 0 and dist < 30.0:
+            for prefix, weight in CONSTRUCTION_PRIMARY_WEIGHTS.items():
+                if cat.startswith(prefix):
+                    construction.append({**rec, "weight": weight, "role": "primary"})
+                    break
+            else:
+                for prefix, weight in CONSTRUCTION_SUPPORT_WEIGHTS.items():
+                    if cat.startswith(prefix):
+                        construction.append({**rec, "weight": weight, "role": "support"})
+                        break
 
         if (cat.startswith("human.pedestrian")
                 and not cat.startswith("human.pedestrian.construction_worker")
@@ -132,12 +143,15 @@ def debug_sample(nusc, sample_token: str) -> None:
                 f"x_fwd={r['x_fwd']:+6.1f}  y_lat={r['y_lat']:+6.1f}  "
                 f"ang={r['angle']:+6.1f}°  [{_fov_tag(r['x_fwd'], r['angle'])}]")
 
-    cz_score = sum(r["weight"] for r in construction)
-    cz_fires = cz_score >= 5
+    cz_primary = sum(r["weight"] for r in construction if r["role"] == "primary")
+    cz_support = sum(r["weight"] for r in construction if r["role"] == "support")
+    cz_total = cz_primary + cz_support
+    cz_fires = cz_primary >= 1 and cz_total >= 5
     print(f"\n[construction_zone_det] would fire = {cz_fires}  "
-          f"(score={cz_score}/5, {len(construction)} annotation(s) in 30 m 360° band)")
-    fov_hits = sum(1 for r in construction if r["x_fwd"] > 0
-                   and abs(r["angle"]) < FRONT_CAM_HALF_FOV_DEG)
+          f"(primary={cz_primary}, support={cz_support}, total={cz_total}/5, "
+          f"{len(construction)} annotation(s) in 30 m forward half-plane)")
+    fov_hits = sum(1 for r in construction
+                   if abs(r["angle"]) < FRONT_CAM_HALF_FOV_DEG)
     if construction:
         print(f"  → in front-cam FOV: {fov_hits}/{len(construction)}")
     for r in sorted(construction, key=lambda r: r["dist"]):
