@@ -263,6 +263,13 @@ def main() -> None:
     with open(out_path, "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"Wrote {out_path}")
+    print(f"  schema_version: {manifest['schema_version']}  "
+          f"({len(manifest['concept_order'])} concepts: "
+          f"{layout['continuous']['n']} cont, {layout['binary']['n']} bin, "
+          f"{layout['categorical']['n']} cat)")
+    print(f"  schema_hash:    {manifest['schema_hash']}")
+    print("  → pass this hash to ConceptStore(schema_hash=...) at train time to "
+          "guard against train/data schema drift.")
 
 
 if __name__ == "__main__":
