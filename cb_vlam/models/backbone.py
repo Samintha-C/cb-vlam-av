@@ -77,12 +77,21 @@ class CBVLAMBackbone(nn.Module):
         base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             str(checkpoint_path), torch_dtype=torch_dtype, device_map=device,
         )
-        self.hidden_size = base.config.hidden_size
+        # Qwen2.5-VL nests the LLM params under config.text_config; the tapped
+        # decoder hidden states have that text hidden size (3584 for 7B).
+        text_cfg = getattr(base.config, "text_config", None)
+        self.hidden_size = (getattr(text_cfg, "hidden_size", None)
+                            or getattr(base.config, "hidden_size", None))
+        if self.hidden_size is None:
+            raise RuntimeError("Could not resolve hidden_size from the model config.")
 
         # Joint training: cache must be off, and (with a frozen base) the input
         # embeddings must emit grad so gradient checkpointing reconnects the
-        # graph to the LoRA adapters.
+        # graph to the LoRA adapters. Set use_cache on both the top-level and the
+        # nested text config.
         base.config.use_cache = False
+        if text_cfg is not None:
+            text_cfg.use_cache = False
         if gradient_checkpointing:
             base.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False})
