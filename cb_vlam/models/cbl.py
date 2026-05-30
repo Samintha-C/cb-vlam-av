@@ -24,7 +24,8 @@ class ConceptBottleneckLayer(nn.Module):
                  in_dim: int,
                  layout: Dict[str, Any],
                  hidden_dim: Optional[int] = None,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0,
+                 input_norm: bool = True):
         """
         Args:
             in_dim: Backbone feature dimension (CBVLAMBackbone.feature_dim).
@@ -32,11 +33,17 @@ class ConceptBottleneckLayer(nn.Module):
             hidden_dim: If set, a shared GELU trunk of this width precedes the
                 heads. If None, heads project the backbone feature directly.
             dropout: Dropout on the trunk (ignored when hidden_dim is None).
+            input_norm: If True (default), LayerNorm the backbone feature before
+                the heads. The raw decoder hidden states have large magnitude,
+                which makes initial head outputs (and losses) hot and training
+                unstable; normalizing the input fixes that.
         """
         super().__init__()
         self.n_continuous = layout["continuous"]["n"]
         self.n_binary = layout["binary"]["n"]
         self.cat_ncats: List[int] = list(layout["categorical"]["n_categories"])
+
+        self.input_norm = nn.LayerNorm(in_dim) if input_norm else nn.Identity()
 
         if hidden_dim:
             self.trunk = nn.Sequential(
@@ -59,6 +66,7 @@ class ConceptBottleneckLayer(nn.Module):
         if ref is not None:
             feats = feats.to(ref.dtype)
 
+        feats = self.input_norm(feats)
         h = self.trunk(feats)
         B = h.shape[0]
         return {
