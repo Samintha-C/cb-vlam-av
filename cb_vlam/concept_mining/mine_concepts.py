@@ -6,6 +6,7 @@ the resulting per-frame concept records as a HuggingFace Dataset.
 
 import argparse
 import json
+import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set
 
@@ -146,6 +147,53 @@ def mine_scene(loader: NuScenesLoader,
     return records
 
 
+# ── Scene-level parallelism ───────────────────────────────────────────────────
+# Scenes are independent for passes A+B (kinematic/agent deltas reset and stay
+# within a scene), so the scene loop parallelizes cleanly. Workers are forked
+# AFTER the parent has loaded the NuScenes tables and per-location maps, so those
+# large read-only devkit objects are shared copy-on-write instead of reloaded in
+# every worker. The loader is not picklable, so it reaches workers via fork
+# inheritance of this module global rather than as a Pool argument.
+_WORKER_LOADER: Optional[NuScenesLoader] = None
+_WORKER_CTX: Dict[str, Any] = {}
+
+
+def _worker_init(passes: List[str], sample_token_filter: Optional[Set[str]],
+                 vlm_workers: int, vlm_kwargs: Dict[str, Any]) -> None:
+    """Pool initializer: build per-worker extractor instances once per process."""
+    _WORKER_CTX.update(
+        passes=passes,
+        sample_token_filter=sample_token_filter,
+        vlm_workers=vlm_workers,
+        kinematic=KinematicExtractor(),
+        agent=AgentExtractor(),
+        infra=InfrastructureExtractor(),
+        scene_ctx=SceneContextExtractor(**vlm_kwargs),
+    )
+
+
+def _mine_scene_task(descriptor: Dict[str, Any]):
+    """Pool task: mine one scene, reattaching its cached map by location.
+
+    Returns (scene_name, location, records). The map handle is fetched from the
+    fork-inherited loader cache (a hit — maps were preloaded in the parent), so
+    nothing unpicklable crosses the process boundary.
+    """
+    loader = _WORKER_LOADER
+    scene_info = dict(descriptor)
+    scene_info["nusc_map"] = (
+        loader._get_map(descriptor["location"]) if loader.load_maps else None
+    )
+    records = mine_scene(
+        loader, scene_info,
+        _WORKER_CTX["kinematic"], _WORKER_CTX["agent"], _WORKER_CTX["infra"],
+        _WORKER_CTX["scene_ctx"], _WORKER_CTX["passes"],
+        sample_token_filter=_WORKER_CTX["sample_token_filter"],
+        vlm_workers=_WORKER_CTX["vlm_workers"],
+    )
+    return descriptor["scene_name"], descriptor["location"], records
+
+
 def mine(data_root: Path,
          version: str,
          output_path: Path,
@@ -159,7 +207,8 @@ def mine(data_root: Path,
          vlm_workers: int = 1,
          vlm_image_dim: int = 1024,
          vlm_verbose: bool = False,
-         vlm_timeout: int = 180) -> None:
+         vlm_timeout: int = 180,
+         workers: int = 1) -> None:
     """Main mining loop."""
     sample_token_filter: Optional[Set[str]] = None
     if sample_tokens_file is not None:
@@ -174,18 +223,15 @@ def mine(data_root: Path,
         load_maps="b" in passes,
     )
 
-    kinematic = KinematicExtractor()
-    agent = AgentExtractor()
-    infra = InfrastructureExtractor()
-    scene_ctx = SceneContextExtractor(backend=vlm_backend, model_name=vlm_model,
-                                       keyframe_stride=keyframe_stride,
-                                       max_image_dim=vlm_image_dim,
-                                       verbose=vlm_verbose,
-                                       request_timeout=vlm_timeout)
+    vlm_kwargs = dict(backend=vlm_backend, model_name=vlm_model,
+                      keyframe_stride=keyframe_stride, max_image_dim=vlm_image_dim,
+                      verbose=vlm_verbose, request_timeout=vlm_timeout)
 
     all_records: List[Dict[str, Any]] = []
     vlm_calls_total = 0
 
+    # Consuming iter_scenes() in the parent forces the NuScenes tables and all
+    # needed per-location maps to load now, so worker forks inherit them (COW).
     scenes = list(loader.iter_scenes())
     if locations is not None:
         loc_set = set(locations)
@@ -193,27 +239,58 @@ def mine(data_root: Path,
     if max_scenes is not None:
         scenes = scenes[:max_scenes]
 
+    workers = max(1, int(workers))
+    if workers > 1 and "c" in passes:
+        print(f"  note: workers={workers} with Pass C means up to "
+              f"{workers}×{vlm_workers} concurrent VLM calls — mind rate limits.")
+
     loc_str = ",".join(sorted(set(s["location"] for s in scenes))) if scenes else "none"
     print(f"Mining {len(scenes)} scenes  |  passes={passes}  |  locations={loc_str}  |  "
-          f"vlm={vlm_model if 'c' in passes else 'n/a'}  |  "
+          f"workers={workers}  |  vlm={vlm_model if 'c' in passes else 'n/a'}  |  "
           f"keyframe_stride={keyframe_stride if 'c' in passes else 'n/a'}")
 
-    for scene_idx, scene_info in enumerate(scenes):
-        print(f"\n[{scene_idx+1}/{len(scenes)}] {scene_info['scene_name']}  "
-              f"({scene_info['location']})", flush=True)
+    if workers == 1:
+        # ── Sequential path (unchanged behavior) ──────────────────────────────
+        kinematic = KinematicExtractor()
+        agent = AgentExtractor()
+        infra = InfrastructureExtractor()
+        scene_ctx = SceneContextExtractor(**vlm_kwargs)
 
-        scene_ctx._vlm_call_count = 0
-        records = mine_scene(
-            loader, scene_info, kinematic, agent, infra, scene_ctx, passes,
-            sample_token_filter=sample_token_filter,
-            vlm_workers=vlm_workers,
-        )
-        all_records.extend(records)
+        for scene_idx, scene_info in enumerate(scenes):
+            print(f"\n[{scene_idx+1}/{len(scenes)}] {scene_info['scene_name']}  "
+                  f"({scene_info['location']})", flush=True)
 
-        vlm_calls = getattr(scene_ctx, "_vlm_call_count", 0)
-        vlm_calls_total += vlm_calls
-        print(f"  → {len(records)} frames  |  VLM calls: {vlm_calls}  "
-              f"|  total so far: {vlm_calls_total}", flush=True)
+            scene_ctx._vlm_call_count = 0
+            records = mine_scene(
+                loader, scene_info, kinematic, agent, infra, scene_ctx, passes,
+                sample_token_filter=sample_token_filter,
+                vlm_workers=vlm_workers,
+            )
+            all_records.extend(records)
+
+            vlm_calls = getattr(scene_ctx, "_vlm_call_count", 0)
+            vlm_calls_total += vlm_calls
+            print(f"  → {len(records)} frames  |  VLM calls: {vlm_calls}  "
+                  f"|  total so far: {vlm_calls_total}", flush=True)
+    else:
+        # ── Parallel path: fork workers that share the loaded loader (COW) ─────
+        global _WORKER_LOADER
+        _WORKER_LOADER = loader
+        descriptors = [
+            {"scene_token": s["scene_token"], "scene_name": s["scene_name"],
+             "location": s["location"], "first_sample_token": s["first_sample_token"]}
+            for s in scenes
+        ]
+        ctx = mp.get_context("fork")
+        with ctx.Pool(processes=workers,
+                      initializer=_worker_init,
+                      initargs=(passes, sample_token_filter, vlm_workers, vlm_kwargs)) as pool:
+            for i, (scene_name, location, records) in enumerate(
+                    pool.imap(_mine_scene_task, descriptors), 1):
+                all_records.extend(records)
+                print(f"[{i}/{len(descriptors)}] {scene_name} ({location})  "
+                      f"→ {len(records)} frames  |  total so far: {len(all_records)}",
+                      flush=True)
 
     print(f"\nTotal records: {len(all_records)}  |  Total VLM calls: {vlm_calls_total}")
 
@@ -267,6 +344,12 @@ def main():
     parser.add_argument("--vlm_timeout", type=int, default=180,
                         help="Per-call HTTP timeout in seconds. Bump to 300-600 for "
                              "qwen3 (full) which is slower than qwen3-small.")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of processes to mine scenes in parallel. "
+                             "Scenes are independent for A+B, so this gives near-"
+                             "linear speedup up to the core count. Workers fork the "
+                             "preloaded nuScenes tables/maps (shared copy-on-write). "
+                             "Default 1 (sequential). Requires a fork-capable OS.")
     args = parser.parse_args()
 
     passes = list(args.passes.lower())
@@ -291,6 +374,7 @@ def main():
         vlm_image_dim=args.vlm_image_dim,
         vlm_verbose=args.vlm_verbose,
         vlm_timeout=args.vlm_timeout,
+        workers=args.workers,
     )
 
 
