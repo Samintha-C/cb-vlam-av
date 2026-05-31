@@ -61,6 +61,8 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     ap.add_argument("--lora_r", type=int, default=16)
+    ap.add_argument("--max_image_pixels", type=int, default=262144,
+                    help="Cap processor max_pixels (default = Impromptu's 262144).")
     args = ap.parse_args()
 
     taps = [t.strip() for t in args.feature_taps.split(",") if t.strip()]
@@ -94,6 +96,7 @@ def main() -> None:
         processor_path=args.processor_name,
         dtype=args.dtype,
         lora_r=args.lora_r,
+        max_image_pixels=args.max_image_pixels,
         device=args.device,
     )
     backbone.model.print_trainable_parameters()

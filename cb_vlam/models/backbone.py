@@ -59,6 +59,7 @@ class CBVLAMBackbone(nn.Module):
                  lora_dropout: float = 0.05,
                  lora_target_modules: Sequence[str] = None,
                  gradient_checkpointing: bool = True,
+                 max_image_pixels: int = 262144,
                  device: str = "cuda"):
         super().__init__()
         unknown = set(feature_taps) - set(_TAP_SPECS)
@@ -103,7 +104,20 @@ class CBVLAMBackbone(nn.Module):
             task_type="CAUSAL_LM",
         )
         self.model = get_peft_model(base, lora_cfg)
-        self.processor = AutoProcessor.from_pretrained(processor_path or str(checkpoint_path))
+
+        # Match Impromptu's training resolution (image_max_pixels=262144 ≈ 512²).
+        # The full nuScenes frame (1600×900 ≈ 1.44M px) is ~5.5× larger than the
+        # backbone was trained on — slower AND out-of-distribution for its vision
+        # tokenizer. Capping max_pixels both speeds the forward and keeps the
+        # tapped hidden states in the regime the model was trained for.
+        self.max_image_pixels = max_image_pixels
+        self.processor = AutoProcessor.from_pretrained(
+            processor_path or str(checkpoint_path), max_pixels=max_image_pixels)
+        ip = getattr(self.processor, "image_processor", None)
+        if ip is not None and hasattr(ip, "max_pixels"):
+            ip.max_pixels = max_image_pixels  # belt-and-suspenders across versions
+            if isinstance(getattr(ip, "size", None), dict):
+                ip.size = {**ip.size, "longest_edge": max_image_pixels}
 
     @property
     def feature_dim(self) -> int:

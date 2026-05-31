@@ -80,6 +80,9 @@ def main() -> None:
     ap.add_argument("--feature_taps", default="endprompt_final")
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     ap.add_argument("--lora_r", type=int, default=16)
+    ap.add_argument("--max_image_pixels", type=int, default=262144,
+                    help="Cap processor max_pixels (default 262144 = Impromptu's "
+                         "image_max_pixels). Lower = faster but more downscaling.")
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_accum", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=3)
@@ -115,7 +118,8 @@ def main() -> None:
     backbone = CBVLAMBackbone(
         checkpoint_path=args.checkpoint, feature_taps=taps,
         processor_path=args.processor_name, dtype=args.dtype,
-        lora_r=args.lora_r, device=args.device)
+        lora_r=args.lora_r, max_image_pixels=args.max_image_pixels,
+        device=args.device)
     backbone.model.print_trainable_parameters()
     cbl = ConceptBottleneckLayer(in_dim=backbone.feature_dim,
                                  layout=store.manifest["per_type"]).to(args.device)
