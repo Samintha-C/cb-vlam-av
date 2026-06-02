@@ -89,6 +89,8 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--schema_hash", default=None,
+                    help="Expected manifest schema_hash — asserts no store/schema drift.")
     ap.add_argument("--eval_every", type=int, default=500, help="optimizer steps between evals")
     ap.add_argument("--max_train_samples", type=int, default=None)
     ap.add_argument("--max_val_samples", type=int, default=None)
@@ -101,7 +103,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    store = ConceptStore(args.concept_store)
+    store = ConceptStore(args.concept_store, schema_hash=args.schema_hash or None)
     jsons = [args.impromptu_train, args.impromptu_test]
     train_ds = ConceptDataset(store, "train", jsons, args.nuscenes_root,
                               max_samples=args.max_train_samples)
