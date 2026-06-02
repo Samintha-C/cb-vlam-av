@@ -9,21 +9,21 @@ from typing import Dict, Iterable, List
 # Each concept is described by (name, type, description).
 # Types: "float" (continuous), "binary" (0.0 or 1.0), "categorical" (integer index)
 
+# NOTE: the continuous ego-kinematic concepts (ego_speed, ego_acceleration,
+# ego_yaw_rate, ego_speed_delta, lateral_acceleration) were PRUNED after Phase-1:
+# they are not recoverable as metric values from a single front-camera frame
+# (motion only appears as raw ego-position history text), so their projection R²
+# was negative. The actionable signal is preserved by the binary thresholds
+# below (ego_stopped/braking/turning), which the model projects near-perfectly.
 PASS_A_CONCEPTS: List[Dict] = [
-    {"name": "ego_speed", "type": "float", "desc": "Ego vehicle speed (m/s), normalized to [0, 1] over [0, 30]"},
-    {"name": "ego_acceleration", "type": "float", "desc": "Ego longitudinal acceleration (m/s^2), normalized to [-1, 1] over [-5, 5]"},
-    {"name": "ego_yaw_rate", "type": "float", "desc": "Ego yaw rate (rad/s), normalized to [-1, 1] over [-pi/4, pi/4]"},
-    {"name": "ego_speed_delta", "type": "float", "desc": "Speed change over the last ~1.5 s (lookback_frames=3 at 2 Hz), normalized [-1, 1] over [-30, 30] m/s. Captures sustained deceleration trends; distinct from the instantaneous ego_acceleration signal."},
     {"name": "ego_stopped", "type": "binary", "desc": "1.0 if ego speed < 0.5 m/s"},
     {"name": "ego_braking", "type": "binary", "desc": "1.0 if ego acceleration < -1 m/s^2"},
     {"name": "ego_turning", "type": "binary", "desc": "1.0 if abs(ego yaw rate) > 0.1 rad/s"},
-    {"name": "lateral_acceleration", "type": "float", "desc": "Lateral accel = yaw_rate * forward_speed (m/s^2), normalized to [-1, 1] over [-5, 5]"},
 ]
 
 PASS_B_AGENT_CONCEPTS: List[Dict] = [
     {"name": "lead_vehicle_present", "type": "binary", "desc": "1.0 if there is a vehicle ahead of ego in the same lane within 50m"},
     {"name": "lead_vehicle_distance", "type": "float", "desc": "Distance to lead vehicle (m), normalized [0, 1] over [0, 50]. 1.0 if no lead vehicle."},
-    {"name": "lead_vehicle_relative_velocity", "type": "float", "desc": "Closing rate (m/s, positive = approaching), normalized [-1, 1] over [-10, 10]"},
     {"name": "lead_vehicle_decelerating", "type": "binary", "desc": "1.0 if lead vehicle's acceleration < -1 m/s^2"},
     {"name": "pedestrian_ahead", "type": "binary", "desc": "1.0 if any pedestrian is within 10m ahead of ego in the forward corridor (±4m lateral)"},
     {"name": "nearest_pedestrian_distance", "type": "float", "desc": "Distance to nearest pedestrian ahead of ego (m), normalized [0, 1] over [0, 30]. 1.0 if none ahead."},
@@ -34,14 +34,14 @@ PASS_B_AGENT_CONCEPTS: List[Dict] = [
     {"name": "parked_cars_present", "type": "binary", "desc": "1.0 if any stationary vehicle (|v|<0.5 m/s) is in the side bands within ±15m"},
     # ── Deterministic annotation-based concepts (suffix _det disambiguates
     # from VLM versions of the same concept in Pass C).
-    {"name": "emergency_vehicle_present_det", "type": "binary", "desc": "1.0 if any vehicle.emergency.* annotation within 30m (ambulance/police/fire)"},
+    # PRUNED after Phase-1: emergency_vehicle_present_det, animal_or_debris_on_road_det
+    # (0 / near-0 positives in val → unlearnable), and the lead-vehicle dynamics
+    # time_to_collision_lead, following_distance_seconds (require the lead's
+    # motion over time, unavailable from a single frame).
     {"name": "construction_zone_det", "type": "binary", "desc": "1.0 if construction evidence ahead within 30m (forward half-plane). Weighted: cone=1, worker=3, construction_vehicle=3 (primary); barrier=1 (support). Fires iff primary>=1 and primary+support>=5 — barriers corroborate but cannot trigger alone (permanent road dividers are densely annotated in nuScenes)."},
-    {"name": "animal_or_debris_on_road_det", "type": "binary", "desc": "1.0 if any animal or movable_object.debris annotation within 30m AHEAD of ego"},
     {"name": "pedestrian_intent_crossing_det", "type": "binary", "desc": "1.0 if any pedestrian AHEAD of ego with pedestrian.moving attribute is within 15m and within 5m of a ped_crossing polygon"},
     {"name": "pedestrian_density", "type": "float", "desc": "Count of pedestrians within 30m AHEAD of ego, normalized [0, 1] over [0, 5]"},
     {"name": "traffic_density_det", "type": "categorical", "values": ["light", "moderate", "heavy"], "desc": "Per-lane traffic density: moving vehicles within 30m divided by lane count near ego (HD-map lane layer in 10m radius). light=<1.0 v/lane, moderate=<2.0, heavy=>=2.0"},
-    {"name": "time_to_collision_lead", "type": "float", "desc": "Lead distance / closing rate (s), clipped to [0, 1] over [0, 10]. 1.0 if no lead or not closing."},
-    {"name": "following_distance_seconds", "type": "float", "desc": "Lead distance / ego speed (s), clipped to [0, 1] over [0, 5]. 1.0 if no lead or ego stopped."},
 ]
 
 PASS_B_INFRA_CONCEPTS: List[Dict] = [
@@ -56,10 +56,10 @@ PASS_B_INFRA_CONCEPTS: List[Dict] = [
     # ── Deterministic map-layer concepts.
     {"name": "over_stop_line", "type": "binary", "desc": "1.0 if ego position is on a stop_line polygon"},
     {"name": "nearest_crosswalk_distance", "type": "float", "desc": "Distance to nearest ped_crossing polygon (m), normalized [0, 1] over [0, 30]. 1.0 if none within 30m."},
-    {"name": "on_walkway", "type": "binary", "desc": "1.0 if ego position is on a walkway polygon (anomaly: ego should not be on sidewalks)"},
-    {"name": "in_carpark", "type": "binary", "desc": "1.0 if ego position is inside a carpark_area polygon"},
+    # PRUNED after Phase-1: on_walkway, in_carpark — 0 positives across the data
+    # (ego never drives on sidewalks; nuScenes only maps carparks the ego entered).
     {"name": "traffic_light_location_ahead", "type": "binary", "desc": "1.0 if any traffic_light polygon is within 50m ahead of ego (location only; state is VLM-only)"},
-    {"name": "ego_lateral_offset_in_lane", "type": "float", "desc": "Perpendicular distance from ego to current lane centerline (m), normalized [-1, 1] over [-2, 2]. 0.0 if no lane found."},
+    {"name": "ego_lateral_offset_in_lane", "type": "float", "desc": "Perpendicular distance from ego to current lane centerline (m), normalized [-1, 1] over [-2, 2]. 0.0 if no lane found. NOTE: the 0.0 no-lane sentinel collides with lane-centered (also ~0.0); a masked-no-lane encoding is a pending fix before this concept can be fairly judged."},
 ]
 
 PASS_C_SCENE_CONCEPTS: List[Dict] = [

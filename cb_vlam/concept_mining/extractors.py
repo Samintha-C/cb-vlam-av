@@ -105,14 +105,9 @@ class KinematicExtractor(BaseExtractor):
                 "speed_history": [0.0],
             }
             return {
-                "ego_speed": 0.0,
-                "ego_acceleration": 0.0,
-                "ego_yaw_rate": 0.0,
-                "ego_speed_delta": 0.0,
                 "ego_stopped": 1.0,
                 "ego_braking": 0.0,
                 "ego_turning": 0.0,
-                "lateral_acceleration": 0.0,
             }
 
         dt = (ego_pose["timestamp"] - prev_ego_pose["timestamp"]) / 1e6
@@ -145,16 +140,13 @@ class KinematicExtractor(BaseExtractor):
         # Normalize per schema bounds.
         speed_norm = _clip(speed_mps / self.max_speed_mps, 0.0, 1.0)
 
-        lat_accel_mps2 = yaw_rate_radps * speed_mps
+        # Pruned continuous kinematics (ego_speed/acceleration/yaw_rate/
+        # speed_delta/lateral_acceleration) are no longer emitted; the binary
+        # thresholds below still derive from the same local quantities.
         out = {
-            "ego_speed": speed_norm,
-            "ego_acceleration": _clip(accel_mps2 / self.max_accel_mps2, -1.0, 1.0),
-            "ego_yaw_rate": _clip(yaw_rate_radps / self.max_yaw_rate_radps, -1.0, 1.0),
-            "ego_speed_delta": speed_delta_k,
             "ego_stopped": 1.0 if speed_mps < self.stopped_speed_mps else 0.0,
             "ego_braking": 1.0 if accel_mps2 < self.braking_accel_mps2 else 0.0,
             "ego_turning": 1.0 if abs(yaw_rate_radps) > self.turning_yaw_rate_radps else 0.0,
-            "lateral_acceleration": _clip(lat_accel_mps2 / self.max_accel_mps2, -1.0, 1.0),
         }
 
         self.prev_state = {
@@ -324,22 +316,19 @@ class AgentExtractor(BaseExtractor):
             else:
                 follow_norm = 1.0
 
+            # Pruned: lead_vehicle_relative_velocity, time_to_collision_lead,
+            # following_distance_seconds (need the lead's motion over time,
+            # unavailable from a single frame).
             out_lead = {
                 "lead_vehicle_present":           1.0,
                 "lead_vehicle_distance":          float(np.clip(lead_dist_m / self.lead_vehicle_max_distance_m, 0.0, 1.0)),
-                "lead_vehicle_relative_velocity": float(np.clip(closing_rate / 10.0, -1.0, 1.0)),
                 "lead_vehicle_decelerating":      1.0 if lead_accel < -1.0 else 0.0,
-                "time_to_collision_lead":         ttc_norm,
-                "following_distance_seconds":     follow_norm,
             }
         else:
             out_lead = {
                 "lead_vehicle_present":           0.0,
                 "lead_vehicle_distance":          1.0,
-                "lead_vehicle_relative_velocity": 0.0,
                 "lead_vehicle_decelerating":      0.0,
-                "time_to_collision_lead":         1.0,
-                "following_distance_seconds":     1.0,
             }
 
         # ── Pedestrians ───────────────────────────────────────────────────────
@@ -554,9 +543,9 @@ class AgentExtractor(BaseExtractor):
             "left_lane_blocked":     1.0 if left_blocked  else 0.0,
             "right_lane_blocked":    1.0 if right_blocked else 0.0,
             "parked_cars_present":   1.0 if parked        else 0.0,
-            "emergency_vehicle_present_det":  1.0 if emergency_present else 0.0,
+            # Pruned: emergency_vehicle_present_det, animal_or_debris_on_road_det
+            # (0 / near-0 positives — unlearnable).
             "construction_zone_det":          1.0 if construction_present else 0.0,
-            "animal_or_debris_on_road_det":   1.0 if animal_or_debris else 0.0,
             "pedestrian_intent_crossing_det": ped_intent,
             "pedestrian_density":             ped_density_norm,
             "traffic_density_det":            traffic_dens_idx,
@@ -818,8 +807,7 @@ class InfrastructureExtractor(BaseExtractor):
             "in_intersection":          in_intersection,
             "over_stop_line":               over_stop_line,
             "nearest_crosswalk_distance":   crosswalk_dist_norm,
-            "on_walkway":                   on_walkway,
-            "in_carpark":                   in_carpark,
+            # Pruned: on_walkway, in_carpark (0 positives across the data).
             "traffic_light_location_ahead": tl_location_ahead,
             "ego_lateral_offset_in_lane":   lateral_offset_norm,
         }
