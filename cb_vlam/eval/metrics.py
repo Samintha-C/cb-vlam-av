@@ -86,26 +86,51 @@ def evaluate(backbone, cbl, loader, device: str,
     return out
 
 
+# Target-std floor (on the normalized concept scale) below which a continuous
+# concept is treated as near-constant. R² there is unreliable: the variance
+# denominator is tiny, so near-mean predictions (small MAE) still yield large
+# negative R². For such concepts we (a) flag low_variance, (b) report a
+# variance-floored R² that can't blow up, and (c) exclude them from the headline
+# macro R² so it reflects only concepts where R² is meaningful. MAE is primary.
+STD_FLOOR = 0.1
+
+
 def _continuous_metrics(pred, tgt, mask, names) -> Dict[str, Any]:
     per = {}
-    maes, r2s = [], []
+    maes, r2_reliable, r2f_all = [], [], []
+    var_floor = STD_FLOOR ** 2
+    n_low_var = 0
     for j, n in enumerate(names):
         m = mask[:, j].astype(bool)
         if m.sum() == 0:
-            per[n] = {"mae": None, "rmse": None, "r2": None, "n": 0}
+            per[n] = {"mae": None, "rmse": None, "r2": None, "r2_floored": None,
+                      "std": None, "low_variance": None, "n": 0}
             continue
         p, t = pred[m, j], tgt[m, j]
         mae = float(np.mean(np.abs(p - t)))
-        rmse = float(np.sqrt(np.mean((p - t) ** 2)))
-        ss_tot = float(np.sum((t - t.mean()) ** 2))
-        r2 = float(1.0 - np.sum((p - t) ** 2) / ss_tot) if ss_tot > 0 else None
-        per[n] = {"mae": mae, "rmse": rmse, "r2": r2, "n": int(m.sum())}
+        mse = float(np.mean((p - t) ** 2))
+        var = float(np.var(t))
+        std = float(np.sqrt(var))
+        low_var = std < STD_FLOOR
+        r2 = float(1.0 - mse / var) if var > 0 else None
+        # Variance-floored R²: denominator can't drop below the floor, so a
+        # near-constant target can't produce a meaningless huge-negative R².
+        r2_floored = float(1.0 - mse / max(var, var_floor))
+        per[n] = {"mae": mae, "rmse": float(np.sqrt(mse)), "r2": r2,
+                  "r2_floored": r2_floored, "std": std,
+                  "low_variance": bool(low_var), "n": int(m.sum())}
         maes.append(mae)
-        if r2 is not None:
-            r2s.append(r2)
+        r2f_all.append(r2_floored)
+        if low_var:
+            n_low_var += 1
+        elif r2 is not None:
+            r2_reliable.append(r2)
     return {"per_concept": per,
             "macro_mae": float(np.mean(maes)) if maes else None,
-            "macro_r2": float(np.mean(r2s)) if r2s else None}
+            # Headline R² over adequate-variance concepts only (others flagged).
+            "macro_r2": float(np.mean(r2_reliable)) if r2_reliable else None,
+            "macro_r2_floored": float(np.mean(r2f_all)) if r2f_all else None,
+            "n_low_variance": n_low_var}
 
 
 def _binary_metrics(prob, tgt, mask, names) -> Dict[str, Any]:
@@ -171,8 +196,11 @@ def summarize(metrics: Dict[str, Any]) -> str:
     if "loss" in metrics:
         parts.append(f"loss={_fmt(metrics['loss'])}")
     if "continuous" in metrics:
-        parts.append(f"cont MAE={_fmt(metrics['continuous']['macro_mae'])} "
-                     f"R2={_fmt(metrics['continuous']['macro_r2'])}")
+        c = metrics["continuous"]
+        nlv = c.get("n_low_variance", 0)
+        lv = f" [-{nlv} low-var]" if nlv else ""
+        parts.append(f"cont MAE={_fmt(c['macro_mae'])} "
+                     f"R2={_fmt(c.get('macro_r2'))}{lv}")
     if "binary" in metrics:
         parts.append(f"bin AUROC={_fmt(metrics['binary']['macro_auroc'])} "
                      f"F1={_fmt(metrics['binary']['macro_f1'])}")

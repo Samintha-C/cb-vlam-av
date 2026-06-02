@@ -136,6 +136,10 @@ def main() -> None:
     best_val = math.inf
     step = 0
     micro = 0
+    samples_seen = 0
+    # Running sums over the log window (reset each print) so the reported loss is
+    # the mean over many samples, not one noisy 4-sample microbatch.
+    win = {"total": 0.0, "c": 0.0, "b": 0.0, "k": 0.0, "n": 0}
     opt.zero_grad()
     backbone.model.train(); cbl.train()
     t0 = time.time()
@@ -146,6 +150,10 @@ def main() -> None:
             losses = concept_loss(pred, target, bin_pos_weight=pos_weight)
             (losses["total"] / args.grad_accum).backward()
             micro += 1
+            samples_seen += len(batch["prompts"])
+            win["total"] += losses["total"].item(); win["c"] += losses["continuous"].item()
+            win["b"] += losses["binary"].item(); win["k"] += losses["categorical"].item()
+            win["n"] += 1
 
             if micro % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -153,12 +161,13 @@ def main() -> None:
                 step += 1
 
                 if step % 50 == 0:
-                    rate = micro / (time.time() - t0)
-                    print(f"e{epoch} step{step}  loss={losses['total'].item():.4f} "
-                          f"(c={losses['continuous'].item():.3f} "
-                          f"b={losses['binary'].item():.3f} "
-                          f"k={losses['categorical'].item():.3f})  "
-                          f"lr={sched.get_last_lr()[0]:.2e}  {rate:.2f} smp/s", flush=True)
+                    n = max(win["n"], 1)
+                    rate = samples_seen / (time.time() - t0)
+                    print(f"e{epoch} step{step}  loss={win['total']/n:.4f} "
+                          f"(c={win['c']/n:.3f} b={win['b']/n:.3f} k={win['k']/n:.3f})  "
+                          f"lr={sched.get_last_lr()[0]:.2e}  {rate:.2f} smp/s "
+                          f"[mean/{n} microbatches]", flush=True)
+                    win = {"total": 0.0, "c": 0.0, "b": 0.0, "k": 0.0, "n": 0}
 
                 if step % args.eval_every == 0:
                     best_val = _do_eval(backbone, cbl, val_loader, store, pos_weight,
