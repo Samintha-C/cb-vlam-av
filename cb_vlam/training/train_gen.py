@@ -11,14 +11,24 @@ Data flow (single scene tap → one trajectory per sample):
                                        ├─► CBL ─────► ĉ ──(to_activations)──┐
                                        └─► Residual ─► r ──────────────────┤
                                                        │                   ▼
-                                          Adversary(GRL(r)) ◄──   FinalPredictor([ĉ⊕r]) ─► 6×2 waypoints
+                                              Adversary(r)           FinalPredictor([ĉ⊕r]) ─► 6×2 waypoints
 
-Loss:  L = L_c + λ_t·L_t + L_adv(GRL) + λ_reg·R(W_concept)
-  L_c   masked per-type concept loss (the bottleneck stays faithful)
-  L_t   smooth-L1 on the waypoints (the driving task)
-  L_adv concept_loss on the adversary; the Gradient-Reversal Layer makes the
-        residual concept-uninformative so concepts stay the steerable handle
-  R     elastic-net sparsity on the final layer's concept columns
+Disentanglement follows CB-LLM (train_CBLLM.py:154-175) via gradient CONFINEMENT
+rather than a fused gradient-reversal term — three scoped backwards per step:
+
+  1. MAIN      L_main = L_c + λ_t·L_t + λ_reg·R       → backbone + CBL + residual + head
+               masked concept loss + smooth-L1 waypoints + elastic-net sparsity.
+  2. ADVERSARY L_adv  = concept_loss(adv(r.detach())) → ONLY the adversary
+               the probe learns to read concepts off r, touching nothing else.
+  3. DISENTANGLE L_dis = disentanglement_loss(adv(residual(h.detach())))
+               → ONLY the residual; pushes r toward the probe's uninformative
+               prior (bounded entropy / marginal-mean) so concepts stay the
+               steerable handle. h is detached so the backbone is never moved by
+               the adversarial signal — that confinement is what makes it stable
+               (the earlier fused-GRL form diverged as λ ramped up).
+
+Best-model selection uses L_c + λ_t·L_t only (CB-LLM train_CBLLM.py:220) — the
+adversarial terms are diagnostics, not part of model quality.
 
 Usage: see naut/train-gen-regression-capped.yaml.
 """
@@ -43,11 +53,11 @@ from cb_vlam.models.adversarial import AdversarialDiscriminator
 from cb_vlam.models.final_predictor import FinalPredictor
 from cb_vlam.training.dataset import ConceptDataset, collate
 from cb_vlam.training.losses import (
-    concept_loss, adversary_loss, trajectory_loss, elastic_net_penalty,
-    binary_pos_weight_from_manifest)
+    concept_loss, adversary_loss, disentanglement_loss, trajectory_loss,
+    elastic_net_penalty, binary_pos_weight_from_manifest)
 
 
-class Trunk:
+class GenerationModules:
     """Holds the four trainable head modules so they pass around as a unit."""
     def __init__(self, cbl, residual, adversary, head):
         self.cbl, self.residual, self.adversary, self.head = cbl, residual, adversary, head
@@ -69,22 +79,31 @@ class Trunk:
 
 
 def _adv_lambda(step: int, args) -> float:
-    """Linear 0→lambda_adv ramp over adv_warmup steps (DANN-style), then hold."""
+    """Optional linear 0→lambda_adv ramp over adv_warmup steps, then hold.
+
+    CB-LLM uses no ramp (effective weight 1.0). With confinement the disentangle
+    term cannot destabilize the modules, so a ramp is only a mild easing knob;
+    adv_warmup=0 reproduces CB-LLM exactly.
+    """
     if args.adv_warmup <= 0:
         return args.lambda_adv
     return args.lambda_adv * min(1.0, step / args.adv_warmup)
 
 
-def _forward(backbone, trunk: Trunk, batch, device, lam_adv: float):
-    feats = torch.stack(
+def _backbone_feats(backbone, batch):
+    """Stack the per-sample backbone features (the one expensive forward)."""
+    return torch.stack(
         [backbone(img, prm) for img, prm in zip(batch["images"], batch["prompts"])],
         dim=0)
-    cbl_out = trunk.cbl(feats)
-    cvec = trunk.cbl.to_activations(cbl_out)
-    r = trunk.residual(feats)
-    traj = trunk.head(cvec, r)
-    adv_out = trunk.adversary(r, lambda_=lam_adv)
-    return cbl_out, traj, adv_out
+
+
+def _predict(modules: GenerationModules, feats):
+    """CBL + residual + head forward → (cbl_out, r, traj). Used by main + eval."""
+    cbl_out = modules.cbl(feats)
+    cvec = modules.cbl.to_activations(cbl_out)
+    r = modules.residual(feats)
+    traj = modules.head(cvec, r)
+    return cbl_out, r, traj
 
 
 def main() -> None:
@@ -105,8 +124,13 @@ def main() -> None:
     ap.add_argument("--residual_dim", type=int, default=128)
     ap.add_argument("--lambda_traj", type=float, default=1.0)
     ap.add_argument("--lambda_reg", type=float, default=1e-3)
-    ap.add_argument("--lambda_adv", type=float, default=1.0, help="GRL strength (held after warmup)")
-    ap.add_argument("--adv_warmup", type=int, default=500, help="opt steps to ramp lambda_adv 0→max")
+    ap.add_argument("--lambda_adv", type=float, default=1.0,
+                    help="Weight on the confined disentanglement term. CB-LLM uses "
+                         "1.0; safe here because the term is gradient-confined to the "
+                         "residual (it cannot corrupt the backbone/concept path), so "
+                         "the divergence the fused-GRL form showed cannot recur.")
+    ap.add_argument("--adv_warmup", type=int, default=0,
+                    help="opt steps to ramp lambda_adv 0→max (0 = CB-LLM's no-ramp).")
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_accum", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=1)
@@ -139,7 +163,7 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, collate_fn=collate)
 
-    # ── Model: fresh LoRA backbone + fresh trunk (everything trainable) ────────
+    # ── Model: fresh LoRA backbone + fresh modules (everything trainable) ────────
     backbone = CBVLAMBackbone(
         checkpoint_path=args.checkpoint, feature_taps=taps,
         processor_path=args.processor_name, dtype=args.dtype,
@@ -154,12 +178,12 @@ def main() -> None:
                                          layout=layout).to(args.device)
     head = FinalPredictor(cbl.activation_dim, args.residual_dim,
                           output_dim=args.horizon * 2, mode="regression").to(args.device)
-    trunk = Trunk(cbl, residual, adversary, head)
+    modules = GenerationModules(cbl, residual, adversary, head)
     pos_weight = binary_pos_weight_from_manifest(store.manifest).to(args.device)
     print(f"feature_dim={backbone.feature_dim} activation_dim={cbl.activation_dim} "
           f"residual_dim={args.residual_dim} traj_dim={args.horizon*2}")
 
-    params = list(backbone.trainable_parameters()) + list(trunk.parameters())
+    params = list(backbone.trainable_parameters()) + list(modules.parameters())
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     total_steps = max(1, (len(train_loader) // args.grad_accum) * args.epochs)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
@@ -169,28 +193,44 @@ def main() -> None:
     # ── Train ─────────────────────────────────────────────────────────────────
     best_val = math.inf
     step = micro = samples_seen = 0
-    win = {"total": 0.0, "c": 0.0, "t": 0.0, "adv": 0.0, "n": 0}
+    win = {"main": 0.0, "c": 0.0, "t": 0.0, "adv": 0.0, "dis": 0.0, "n": 0}
+    adv_params = list(modules.adversary.parameters())
+    res_params = list(modules.residual.parameters())
     opt.zero_grad()
-    backbone.model.train(); trunk.train()
+    backbone.model.train(); modules.train()
     t0 = time.time()
 
     for epoch in range(args.epochs):
         for batch in train_loader:
-            lam = _adv_lambda(step, args)
-            cbl_out, traj, adv_out = _forward(backbone, trunk, batch, args.device, lam)
             targets = {k: v.to(args.device) for k, v in batch["targets"].items()}
-            Lc = concept_loss(cbl_out, targets, bin_pos_weight=pos_weight)["total"]
-            Lt = trajectory_loss(traj, batch["trajectory"].to(args.device),
-                                 mask=batch["trajectory_mask"].to(args.device))
-            Ladv = adversary_loss(adv_out, targets, bin_pos_weight=pos_weight)["total"]
-            Lreg = elastic_net_penalty(head.concept_weight)
-            total = Lc + args.lambda_traj * Lt + Ladv + args.lambda_reg * Lreg
+            traj_gt = batch["trajectory"].to(args.device)
+            traj_mask = batch["trajectory_mask"].to(args.device)
+            feats = _backbone_feats(backbone, batch)        # one expensive forward
+            lam = _adv_lambda(step, args)
 
-            (total / args.grad_accum).backward()
+            # 1) MAIN — concepts + trajectory + sparsity → backbone, CBL, residual, head
+            cbl_out, r, traj = _predict(modules, feats)
+            Lc = concept_loss(cbl_out, targets, bin_pos_weight=pos_weight)["total"]
+            Lt = trajectory_loss(traj, traj_gt, mask=traj_mask)
+            Lreg = elastic_net_penalty(modules.head.concept_weight)
+            Lmain = Lc + args.lambda_traj * Lt + args.lambda_reg * Lreg
+            (Lmain / args.grad_accum).backward()
+
+            # 2) ADVERSARY probe — read concepts off r → ONLY the adversary's params
+            adv_out = modules.adversary(r.detach())
+            Ladv = adversary_loss(adv_out, targets, bin_pos_weight=pos_weight)["total"]
+            (Ladv / args.grad_accum).backward(inputs=adv_params)
+
+            # 3) DISENTANGLE — push r to the probe's uninformative prior → ONLY residual.
+            #    feats detached so the adversarial signal never reaches the backbone.
+            dis_out = modules.adversary(modules.residual(feats.detach()))
+            Ldis = disentanglement_loss(dis_out, targets)["total"]
+            (lam * Ldis / args.grad_accum).backward(inputs=res_params)
+
             micro += 1
             samples_seen += len(batch["prompts"])
-            win["total"] += total.item(); win["c"] += Lc.item()
-            win["t"] += Lt.item(); win["adv"] += Ladv.item(); win["n"] += 1
+            win["main"] += Lmain.item(); win["c"] += Lc.item(); win["t"] += Lt.item()
+            win["adv"] += Ladv.item(); win["dis"] += Ldis.item(); win["n"] += 1
 
             if micro % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -200,39 +240,45 @@ def main() -> None:
                 if step % 50 == 0:
                     n = max(win["n"], 1)
                     rate = samples_seen / (time.time() - t0)
-                    print(f"e{epoch} step{step}  loss={win['total']/n:.4f} "
-                          f"(c={win['c']/n:.3f} t={win['t']/n:.3f} adv={win['adv']/n:.3f})  "
+                    print(f"e{epoch} step{step}  main={win['main']/n:.4f} "
+                          f"(c={win['c']/n:.3f} t={win['t']/n:.3f})  "
+                          f"adv={win['adv']/n:.3f} dis={win['dis']/n:.3f}  "
                           f"λadv={lam:.2f} lr={sched.get_last_lr()[0]:.2e}  {rate:.2f} smp/s "
                           f"[mean/{n}]", flush=True)
-                    win = {"total": 0.0, "c": 0.0, "t": 0.0, "adv": 0.0, "n": 0}
+                    win = {"main": 0.0, "c": 0.0, "t": 0.0, "adv": 0.0, "dis": 0.0, "n": 0}
 
                 if step % args.eval_every == 0:
-                    best_val = _do_eval(backbone, trunk, val_loader, store, pos_weight,
+                    best_val = _do_eval(backbone, modules, val_loader, store, pos_weight,
                                         args, taps, step, best_val)
-                    backbone.model.train(); trunk.train()
+                    backbone.model.train(); modules.train()
 
-    _do_eval(backbone, trunk, val_loader, store, pos_weight, args, taps, step, best_val, final=True)
+    _do_eval(backbone, modules, val_loader, store, pos_weight, args, taps, step, best_val, final=True)
     print("Training done.")
 
 
 @torch.no_grad()
-def _do_eval(backbone, trunk: Trunk, val_loader, store, pos_weight, args, taps,
+def _do_eval(backbone, modules: GenerationModules, val_loader, store, pos_weight, args, taps,
              step, best_val, final=False):
-    backbone.model.eval(); trunk.eval()
+    backbone.model.eval(); modules.eval()
     device = args.device
-    tot = {"total": 0.0, "c": 0.0, "t": 0.0, "adv": 0.0, "n": 0}
+    # val_quality = L_c + λ_t·L_t (CB-LLM selects on concept+task only, :220);
+    # adv/dis are adversarial diagnostics, NOT part of model quality.
+    tot = {"q": 0.0, "c": 0.0, "t": 0.0, "adv": 0.0, "dis": 0.0, "n": 0}
     ade_sum = fde_sum = ade_n = fde_n = 0.0
     for batch in val_loader:
-        cbl_out, traj, adv_out = _forward(backbone, trunk, batch, device, args.lambda_adv)
         targets = {k: v.to(device) for k, v in batch["targets"].items()}
-        Lc = concept_loss(cbl_out, targets, bin_pos_weight=pos_weight)["total"]
+        feats = _backbone_feats(backbone, batch)
+        cbl_out, r, traj = _predict(modules, feats)
         gt = batch["trajectory"].to(device); m = batch["trajectory_mask"].to(device)
+        Lc = concept_loss(cbl_out, targets, bin_pos_weight=pos_weight)["total"]
         Lt = trajectory_loss(traj, gt, mask=m)
+        adv_out = modules.adversary(r)
         Ladv = adversary_loss(adv_out, targets, bin_pos_weight=pos_weight)["total"]
-        total = Lc + args.lambda_traj * Lt + Ladv + args.lambda_reg * elastic_net_penalty(trunk.head.concept_weight)
+        Ldis = disentanglement_loss(adv_out, targets)["total"]
+        q = Lc + args.lambda_traj * Lt
         bs = len(batch["prompts"])
-        tot["total"] += total.item() * bs; tot["c"] += Lc.item() * bs
-        tot["t"] += Lt.item() * bs; tot["adv"] += Ladv.item() * bs; tot["n"] += bs
+        tot["q"] += q.item() * bs; tot["c"] += Lc.item() * bs; tot["t"] += Lt.item() * bs
+        tot["adv"] += Ladv.item() * bs; tot["dis"] += Ldis.item() * bs; tot["n"] += bs
 
         # ADE/FDE in meters over valid waypoints.
         B = traj.shape[0]
@@ -244,36 +290,38 @@ def _do_eval(backbone, trunk: Trunk, val_loader, store, pos_weight, args, taps,
         fde_sum += float((d[:, -1] * last_valid).sum()); fde_n += float(last_valid.sum())
 
     n = max(tot["n"], 1)
-    val_total = tot["total"] / n
+    val_q = tot["q"] / n
     ade = ade_sum / max(ade_n, 1.0); fde = fde_sum / max(fde_n, 1.0)
     print(f"\n[eval @ step {step}{' FINAL' if final else ''}] "
-          f"val_total={val_total:.4f} (c={tot['c']/n:.3f} t={tot['t']/n:.3f} "
-          f"adv={tot['adv']/n:.3f})  ADE={ade:.3f}m FDE={fde:.3f}m  n={n}\n", flush=True)
+          f"val_quality={val_q:.4f} (c={tot['c']/n:.3f} t={tot['t']/n:.3f} | "
+          f"adv={tot['adv']/n:.3f} dis={tot['dis']/n:.3f})  "
+          f"ADE={ade:.3f}m FDE={fde:.3f}m  n={n}\n", flush=True)
     (args.output_dir / f"metrics_step{step}.json").write_text(json.dumps({
-        "step": step, "val_total": val_total, "concept_loss": tot["c"] / n,
-        "traj_loss": tot["t"] / n, "adv_loss": tot["adv"] / n,
+        "step": step, "val_quality": val_q, "concept_loss": tot["c"] / n,
+        "traj_loss": tot["t"] / n, "adv_loss": tot["adv"] / n, "dis_loss": tot["dis"] / n,
         "ade_m": ade, "fde_m": fde, "n": n}, indent=2))
 
-    if val_total < best_val:
-        _save(args.output_dir, backbone, trunk, store, args, taps)
-        print(f"  new best val_total {val_total:.4f} → saved", flush=True)
-        return val_total
+    if val_q < best_val:
+        _save(args.output_dir, backbone, modules, store, args, taps)
+        print(f"  new best val_quality {val_q:.4f} → saved", flush=True)
+        return val_q
     return best_val
 
 
-def _save(out_dir: Path, backbone, trunk: Trunk, store, args, taps):
+def _save(out_dir: Path, backbone, modules: GenerationModules, store, args, taps):
     ckpt = out_dir / "best"; ckpt.mkdir(parents=True, exist_ok=True)
     backbone.model.save_pretrained(str(ckpt / "lora_adapter"))
-    torch.save(trunk.cbl.state_dict(), ckpt / "cbl.pt")
-    torch.save(trunk.residual.state_dict(), ckpt / "residual.pt")
-    torch.save(trunk.adversary.state_dict(), ckpt / "adversary.pt")
-    torch.save(trunk.head.state_dict(), ckpt / "final_predictor.pt")
+    torch.save(modules.cbl.state_dict(), ckpt / "cbl.pt")
+    torch.save(modules.residual.state_dict(), ckpt / "residual.pt")
+    torch.save(modules.adversary.state_dict(), ckpt / "adversary.pt")
+    torch.save(modules.head.state_dict(), ckpt / "final_predictor.pt")
     (ckpt / "config.json").write_text(json.dumps({
-        "arm": "B_regression",
+        "mode": "continuous_regression",
+        "disentangle": "cbllm_confined",
         "schema_hash": store.manifest["schema_hash"],
         "schema_version": store.manifest["schema_version"],
         "feature_taps": taps, "feature_dim": backbone.feature_dim,
-        "activation_dim": trunk.cbl.activation_dim, "residual_dim": args.residual_dim,
+        "activation_dim": modules.cbl.activation_dim, "residual_dim": args.residual_dim,
         "horizon": args.horizon, "lora_r": args.lora_r, "checkpoint": args.checkpoint,
         "lambda_traj": args.lambda_traj, "lambda_reg": args.lambda_reg,
         "lambda_adv": args.lambda_adv,

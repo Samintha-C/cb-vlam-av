@@ -86,12 +86,82 @@ def concept_loss(
             "categorical": cat_loss, "total": total}
 
 
-# Generation training losses: trajectory task loss L_t, residual-disentangling
-# adversary loss, and the final-predictor sparsity penalty. The adversary loss
-# is just concept_loss applied to the discriminator's per-type output — the
-# Gradient-Reversal Layer inside AdversarialDiscriminator handles the minimax
-# sign, so it is added to the total like any other term (single backward).
+# Generation training losses: trajectory task loss L_t, the adversarial probe
+# loss, the residual-disentangling objective, and the sparsity penalty.
+#
+# Disentanglement follows CB-LLM (train_CBLLM.py:163-175), NOT a Gradient-Reversal
+# Layer. CB-LLM keeps it stable by gradient *confinement*, not by a small weight:
+#   1. adversary_loss trains the probe to read concepts from r.detach()
+#      (backward restricted to the probe's own params);
+#   2. disentanglement_loss then pushes the residual toward the probe's
+#      *uninformative prior* on r computed from detached backbone features
+#      (backward restricted to the residual's params).
+# Because the adversarial gradient never reaches the backbone or the concept
+# path, it cannot corrupt the shared trunk — which is exactly what a fused GRL
+# backward did (all losses diverged as lambda ramped up). See train_gen.py.
 adversary_loss = concept_loss
+
+
+def disentanglement_loss(
+    pred: Dict[str, Any],
+    target: Dict[str, Any],
+    *,
+    weights: Dict[str, float] = None,
+) -> Dict[str, torch.Tensor]:
+    """Bounded "make the probe uninformative" objective, confined to the residual.
+
+    Minimizing this drives the adversary probe toward its uninformative prior, so
+    the residual is forced to carry no recoverable concept information:
+
+        continuous   → the batch marginal mean (regression R^2 → 0)
+        binary       → maximum Bernoulli entropy (sigmoid → 0.5)
+        categorical  → maximum softmax entropy (uniform over classes)
+
+    This is the mixed-type generalization of CB-LLM's single-class neg-entropy
+    term (train_CBLLM.py:172). Every component is *bounded* — that boundedness is
+    what makes the adversarial pressure stable; plain gradient-ascent on the
+    probe's prediction loss (the GRL form) is unbounded and runs away. Masks
+    follow the concept masks, so absent/saturated concepts contribute nothing.
+
+    Args mirror ``concept_loss``: pred is the probe's per-type output, target the
+    batched ConceptStore targets + masks. Returns per-type sub-losses + "total".
+    """
+    w = {"continuous": 1.0, "binary": 1.0, "categorical": 1.0, **(weights or {})}
+    device = _first_param_device(pred)
+    zero = torch.zeros((), device=device)
+    eps = 1e-6
+
+    # ── Continuous: pull the probe toward the (detached) batch marginal mean ──
+    if pred["continuous"].shape[1] > 0:
+        m = target["continuous_mask"].to(pred["continuous"].dtype)
+        marg = (target["continuous"] * m).sum(0) / m.sum(0).clamp(min=1.0)  # (n_cont,)
+        se = (pred["continuous"] - marg.detach()) ** 2
+        cont = _masked_mean(se, target["continuous_mask"])
+    else:
+        cont = zero
+
+    # ── Binary: minimize Bernoulli neg-entropy → sigmoid pushed to 0.5 ───────
+    if pred["binary_logits"].shape[1] > 0:
+        p = torch.sigmoid(pred["binary_logits"]).clamp(eps, 1.0 - eps)
+        neg_ent = p * p.log() + (1.0 - p) * (1.0 - p).log()
+        binl = _masked_mean(neg_ent, target["binary_mask"])
+    else:
+        binl = zero
+
+    # ── Categorical: minimize softmax neg-entropy → uniform over classes ─────
+    cat_logits: List[torch.Tensor] = pred["categorical_logits"]
+    if cat_logits:
+        terms = []
+        for i, logits in enumerate(cat_logits):
+            logp = F.log_softmax(logits, dim=-1)
+            neg_ent = (logp.exp() * logp).sum(-1)  # (B,) — in [-log K, 0]
+            terms.append(_masked_mean(neg_ent, target["categorical_mask"][:, i]))
+        catl = torch.stack(terms).mean()
+    else:
+        catl = zero
+
+    total = (w["continuous"] * cont + w["binary"] * binl + w["categorical"] * catl)
+    return {"continuous": cont, "binary": binl, "categorical": catl, "total": total}
 
 
 def trajectory_loss(pred: torch.Tensor,
