@@ -1,4 +1,4 @@
-"""Phase-1 joint training: LoRA backbone + CBL, supervised by concept loss only.
+"""Concept-projection joint training: LoRA backbone + CBL, supervised by concept loss only.
 
 This trains the bottleneck to project the backbone representation into concept
 space. The backbone is LoRA-adapted (base frozen), the CBL projects to the
@@ -10,7 +10,7 @@ Batching note: the backbone consumes one (image, prompt) at a time, so a
 "batch" is forwarded sample-by-sample (graphs retained) then backpropagated
 once; --grad_accum accumulates several such batches before an optimizer step.
 
-Usage (see naut/train-cbl-phase1.yaml):
+Usage (see naut/train-concept-proj-smoke.yaml):
     python -m cb_vlam.training.train \
         --concept_store  .../impromptu_concepts_ab/mined \
         --impromptu_train .../nuscenes_train.json \
@@ -18,7 +18,7 @@ Usage (see naut/train-cbl-phase1.yaml):
         --nuscenes_root  /sc-rwx-vol/cbvlam \
         --checkpoint     .../7B_AD_finetune \
         --processor_name Qwen/Qwen2.5-VL-7B-Instruct \
-        --output_dir     .../runs/phase1 \
+        --output_dir     .../runs/concept_proj \
         --feature_taps endprompt_final --batch_size 4 --grad_accum 4 --epochs 3
 """
 

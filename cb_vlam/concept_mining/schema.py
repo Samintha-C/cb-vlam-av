@@ -10,7 +10,7 @@ from typing import Dict, Iterable, List
 # Types: "float" (continuous), "binary" (0.0 or 1.0), "categorical" (integer index)
 
 # NOTE: the continuous ego-kinematic concepts (ego_speed, ego_acceleration,
-# ego_yaw_rate, ego_speed_delta, lateral_acceleration) were PRUNED after Phase-1:
+# ego_yaw_rate, ego_speed_delta, lateral_acceleration) were PRUNED after concept-projection run:
 # they are not recoverable as metric values from a single front-camera frame
 # (motion only appears as raw ego-position history text), so their projection R²
 # was negative. The actionable signal is preserved by the binary thresholds
@@ -34,7 +34,7 @@ PASS_B_AGENT_CONCEPTS: List[Dict] = [
     {"name": "parked_cars_present", "type": "binary", "desc": "1.0 if any stationary vehicle (|v|<0.5 m/s) is in the side bands within ±15m"},
     # ── Deterministic annotation-based concepts (suffix _det disambiguates
     # from VLM versions of the same concept in Pass C).
-    # PRUNED after Phase-1: emergency_vehicle_present_det, animal_or_debris_on_road_det
+    # PRUNED after concept-projection run: emergency_vehicle_present_det, animal_or_debris_on_road_det
     # (0 / near-0 positives in val → unlearnable), and the lead-vehicle dynamics
     # time_to_collision_lead, following_distance_seconds (require the lead's
     # motion over time, unavailable from a single frame).
@@ -56,7 +56,7 @@ PASS_B_INFRA_CONCEPTS: List[Dict] = [
     # ── Deterministic map-layer concepts.
     {"name": "over_stop_line", "type": "binary", "desc": "1.0 if ego position is on a stop_line polygon"},
     {"name": "nearest_crosswalk_distance", "type": "float", "desc": "Distance to nearest ped_crossing polygon (m), normalized [0, 1] over [0, 30]. 1.0 if none within 30m."},
-    # PRUNED after Phase-1: on_walkway, in_carpark — 0 positives across the data
+    # PRUNED after concept-projection run: on_walkway, in_carpark — 0 positives across the data
     # (ego never drives on sidewalks; nuScenes only maps carparks the ego entered).
     {"name": "traffic_light_location_ahead", "type": "binary", "desc": "1.0 if any traffic_light polygon is within 50m ahead of ego (location only; state is VLM-only)"},
     {"name": "ego_lateral_offset_in_lane", "type": "float", "desc": "Perpendicular distance from ego to current lane centerline (m), normalized [-1, 1] over [-2, 2]. 0.0 if no lane found. NOTE: the 0.0 no-lane sentinel collides with lane-centered (also ~0.0); a masked-no-lane encoding is a pending fix before this concept can be fairly judged."},

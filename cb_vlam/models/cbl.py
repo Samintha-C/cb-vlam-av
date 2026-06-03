@@ -43,6 +43,13 @@ class ConceptBottleneckLayer(nn.Module):
         self.n_binary = layout["binary"]["n"]
         self.cat_ncats: List[int] = list(layout["categorical"]["n_categories"])
 
+        # Concept names (canonical order, per type) — used to build the
+        # name→slot map for the concept-activation vector that the downstream
+        # FinalPredictor reads and that intervention overwrites.
+        self.cont_names: List[str] = list(layout["continuous"]["names"])
+        self.bin_names: List[str] = list(layout["binary"]["names"])
+        self.cat_names: List[str] = list(layout["categorical"]["names"])
+
         self.input_norm = nn.LayerNorm(in_dim) if input_norm else nn.Identity()
 
         if hidden_dim:
@@ -84,3 +91,44 @@ class ConceptBottleneckLayer(nn.Module):
         for head in self.cat_heads:
             return head.weight
         return None
+
+    # ── Concept-activation vector ────────────────────────────────────────────
+    # The downstream FinalPredictor reads a single flat vector of *normalized*
+    # concept activations (not raw logits), so every slot has a known meaning
+    # and range — which is what makes intervention/steerability well-defined:
+    #   continuous  → the predicted value as-is (already normalized at mine time)
+    #   binary      → sigmoid(logit)            ∈ [0, 1]
+    #   categorical → softmax(logits)           (n_categories slots, sum to 1)
+    # Layout order is continuous, then binary, then each categorical block.
+
+    @property
+    def activation_dim(self) -> int:
+        return self.n_continuous + self.n_binary + sum(self.cat_ncats)
+
+    @property
+    def activation_slices(self) -> Dict[str, slice]:
+        """Map concept name → its slice in the activation vector (for intervention)."""
+        slices: Dict[str, slice] = {}
+        i = 0
+        for n in self.cont_names:
+            slices[n] = slice(i, i + 1); i += 1
+        for n in self.bin_names:
+            slices[n] = slice(i, i + 1); i += 1
+        for n, k in zip(self.cat_names, self.cat_ncats):
+            slices[n] = slice(i, i + k); i += k
+        return slices
+
+    def to_activations(self, out: Dict[str, Any]) -> torch.Tensor:
+        """Assemble the CBL per-type output into the normalized activation vector.
+
+        Accepts any leading batch shape (e.g. (B, D) or (B, T, D) outputs) and
+        concatenates along the last dimension.
+        """
+        parts: List[torch.Tensor] = []
+        if self.n_continuous:
+            parts.append(out["continuous"])
+        if self.n_binary:
+            parts.append(torch.sigmoid(out["binary_logits"]))
+        for logits in out["categorical_logits"]:
+            parts.append(torch.softmax(logits, dim=-1))
+        return torch.cat(parts, dim=-1)

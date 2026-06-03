@@ -1,6 +1,6 @@
 """Per-type concept-projection metrics for CB-VLAM-AV.
 
-The Phase-1 question is "can we project accurately into concept space?", so the
+The concept-projection question is "can we project accurately into concept space?", so the
 metrics are per concept type, computed only over supervised (unmasked) entries:
 
     continuous   MAE, RMSE, R^2

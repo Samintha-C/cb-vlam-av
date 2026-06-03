@@ -11,8 +11,9 @@ the fixed-shape concept targets into batched tensors.
 """
 
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -24,6 +25,31 @@ from cb_vlam.data.concept_store import ConceptStore
 _TARGET_KEYS = ["continuous", "continuous_mask", "binary", "binary_mask",
                 "categorical", "categorical_mask"]
 
+# Matches a numeric [x, y] pair only — the literal "[x, y]" template in the
+# Impromptu PLANNING preamble has non-numeric content and is skipped, so this
+# extracts exactly the predicted waypoints (verified: all train records → 6).
+_WAYPOINT_RE = re.compile(r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]")
+
+
+def parse_trajectory(assistant_content: str, horizon: int = 6
+                     ) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract the ground-truth waypoints from an Impromptu assistant message.
+
+    Returns (flat (horizon*2,) float32 waypoints in meters, (horizon*2,) bool
+    mask). Pairs beyond `horizon` are dropped; if fewer are found, the missing
+    tail is zero-padded and masked out (mask False). A total parse failure
+    yields an all-zero target with an all-False mask, so the sample contributes
+    nothing to L_t rather than corrupting it.
+    """
+    pairs = _WAYPOINT_RE.findall(assistant_content)[:horizon]
+    traj = np.zeros(horizon * 2, dtype=np.float32)
+    mask = np.zeros(horizon * 2, dtype=bool)
+    for i, (x, y) in enumerate(pairs):
+        traj[2 * i] = float(x)
+        traj[2 * i + 1] = float(y)
+        mask[2 * i] = mask[2 * i + 1] = True
+    return traj, mask
+
 
 class ConceptDataset(Dataset):
     def __init__(self,
@@ -32,6 +58,8 @@ class ConceptDataset(Dataset):
                  impromptu_jsons: Sequence[Path],
                  nuscenes_root: Path,
                  load_image: bool = True,
+                 with_trajectory: bool = False,
+                 horizon: int = 6,
                  max_samples: int = None):
         """
         Args:
@@ -42,11 +70,17 @@ class ConceptDataset(Dataset):
                 — train tokens live in the former, val/test tokens in the latter.
             nuscenes_root: root that image paths in the records resolve against.
             load_image: decode the PIL image in __getitem__ (True for training).
+            with_trajectory: also parse the GT waypoints from the assistant
+                message (generation task loss L_t). Off by default so
+                concept-projection training is unaffected.
+            horizon: number of future waypoints (Impromptu = 6, i.e. 3s @ 0.5s).
             max_samples: optional cap (for quick runs).
         """
         self.store = store
         self.nuscenes_root = Path(nuscenes_root)
         self.load_image = load_image
+        self.with_trajectory = with_trajectory
+        self.horizon = horizon
 
         # token -> Impromptu record (first occurrence wins; the JSONs repeat a
         # sample under different prompt windows — we dedupe to one input).
@@ -76,6 +110,10 @@ class ConceptDataset(Dataset):
             "image_path": str(self.nuscenes_root / rec["images"][0]),
             "target": self.store.get_numpy(tok),  # numpy arrays
         }
+        if self.with_trajectory:
+            traj, mask = parse_trajectory(rec["messages"][1]["content"], self.horizon)
+            item["trajectory"] = traj
+            item["trajectory_mask"] = mask
         if self.load_image:
             with Image.open(item["image_path"]) as im:
                 item["image"] = im.convert("RGB")
@@ -94,4 +132,9 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         for k in _TARGET_KEYS
     }
     out["targets"] = targets
+    if "trajectory" in batch[0]:
+        out["trajectory"] = torch.from_numpy(
+            np.stack([b["trajectory"] for b in batch], axis=0))
+        out["trajectory_mask"] = torch.from_numpy(
+            np.stack([b["trajectory_mask"] for b in batch], axis=0))
     return out

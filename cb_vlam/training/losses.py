@@ -9,8 +9,8 @@ Masked, per-type supervision of the CBL outputs against ConceptStore targets:
 
 Masks (True = supervise) come from ConceptStore and implement the "saturated =
 absent" toggles; masked-out elements contribute nothing to the loss or its
-denominator. This is the only loss needed for Phase 1 (concept-projection
-accuracy); the task/adversarial/sparsity terms come later.
+denominator. This is the only loss needed for concept-projection training;
+the task/adversarial/sparsity terms come later.
 """
 
 from typing import Any, Dict, List, Optional
@@ -84,6 +84,50 @@ def concept_loss(
              + w["categorical"] * cat_loss)
     return {"continuous": cont_loss, "binary": bin_loss,
             "categorical": cat_loss, "total": total}
+
+
+# Generation training losses: trajectory task loss L_t, residual-disentangling
+# adversary loss, and the final-predictor sparsity penalty. The adversary loss
+# is just concept_loss applied to the discriminator's per-type output — the
+# Gradient-Reversal Layer inside AdversarialDiscriminator handles the minimax
+# sign, so it is added to the total like any other term (single backward).
+adversary_loss = concept_loss
+
+
+def trajectory_loss(pred: torch.Tensor,
+                    target: torch.Tensor,
+                    *,
+                    mask: Optional[torch.Tensor] = None,
+                    beta: float = 1.0) -> torch.Tensor:
+    """Task loss L_t for the continuous-regression arm.
+
+    Smooth-L1 (Huber) over the flat waypoint vector — robust to the occasional
+    large-displacement target without the gradient blow-up of plain MSE. ADE/FDE
+    are reported separately as eval metrics; this is the optimization objective.
+
+    Args:
+        pred:   (B, traj_dim) predicted flat waypoints.
+        target: (B, traj_dim) ground-truth flat waypoints.
+        mask:   optional (B,) or (B, traj_dim) bool — True = include. Lets a
+                sample with no valid future (padding) drop out of the loss.
+        beta:   Huber transition point (meters), in the waypoints' own units.
+    """
+    per_elem = F.smooth_l1_loss(pred, target.to(pred.dtype), beta=beta, reduction="none")
+    if mask is None:
+        return per_elem.mean()
+    if mask.dim() == 1:
+        mask = mask[:, None].expand_as(per_elem)
+    return _masked_mean(per_elem, mask)
+
+
+def elastic_net_penalty(weight: torch.Tensor, alpha: float = 0.99) -> torch.Tensor:
+    """Elastic-net sparsity penalty on the final predictor's concept weights.
+
+    alpha*|W|_1 + (1-alpha)*|W|_2^2, mean-reduced — ported from CB-LLM
+    (generation/utils.py:37). Applied to FinalPredictor.concept_weight so each
+    output dimension wires to a *sparse* set of named concepts (interpretability).
+    """
+    return alpha * weight.abs().mean() + (1.0 - alpha) * weight.square().mean()
 
 
 def binary_pos_weight_from_manifest(manifest: Dict[str, Any],
