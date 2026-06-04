@@ -1,22 +1,21 @@
 """Per-concept leaderboard from one or more eval metrics JSON files.
 
-Reads the metrics_step*.json files written by training (cb_vlam.eval.metrics)
-and prints, per concept type, every concept sorted best→worst by its primary
-metric, so you can see which concepts the bottleneck projects well vs. which are
-dead weight (near-chance / negative R²).
+Accepts two JSON formats:
+  - eval_gen.py output  (keys: split, n, trajectory, concepts)
+  - training metrics    (keys: step, val_quality, concept_loss, …)
 
-Primary metric per type: continuous → R², binary → AUROC, categorical → accuracy.
+Prints a trajectory header (L2 @1s/2s/3s/Avg + ADE/FDE) when available,
+then per-concept tables sorted best→worst by primary metric:
+  continuous → R²,  binary → AUROC,  categorical → accuracy.
 
 Single file  → full detail (primary + secondary metrics + support n).
-Multiple files → primary metric as a column per file + delta(last − first), to
-spotlight concepts that improved or regressed (e.g. overfitting between evals).
-Concepts are sorted by the FIRST file's primary metric (None sorts last).
+Multiple files → primary metric as a column per file + delta(last − first).
 
-Pure stdlib — runs anywhere (kubectl cp the JSONs down, or run on the cluster).
+Pure stdlib — runs anywhere.
 
 Usage:
-    python scripts/concept_leaderboard.py metrics_step1500.json
-    python scripts/concept_leaderboard.py metrics_step1500.json metrics_step3000.json
+    python scripts/concept_leaderboard.py eval_stp3.json
+    python scripts/concept_leaderboard.py eval_stp3.json eval_test.json
 """
 
 import argparse
@@ -31,10 +30,12 @@ _SPEC = {
     "categorical": ("accuracy", ["macro_f1"],                 ["macro_accuracy", "macro_f1"]),
 }
 
+_L2_KEYS = [("L2@1s", "l2_1s"), ("L2@2s", "l2_2s"), ("L2@3s", "l2_3s"), ("Avg", "l2_avg")]
+_TRAJ_KEYS = _L2_KEYS + [("ADE", "ade_m"), ("FDE", "fde_m")]
+
 
 def _label(path: Path) -> str:
-    stem = path.stem
-    return stem.replace("metrics_", "") or stem
+    return path.stem or str(path)
 
 
 def _fmt(x: Optional[float], w: int = 7) -> str:
@@ -42,8 +43,26 @@ def _fmt(x: Optional[float], w: int = 7) -> str:
 
 
 def _sort_key(v: Optional[float]):
-    # None / missing sort to the bottom regardless of ascending order.
     return (v is None, -(v if isinstance(v, (int, float)) else 0.0))
+
+
+def _render_trajectory(trajs: List[Optional[Dict]], labels: List[str]) -> None:
+    """Print L2 @1s/2s/3s/Avg + ADE/FDE header if any file has trajectory data."""
+    if not any(t for t in trajs):
+        return
+    multi = len(trajs) > 1
+    print(f"\n{'='*72}\nTRAJECTORY  (ST-P3 cumulative L2, Impromptu q7 convention)\n{'='*72}")
+    col_w = 9
+    head = f"{'metric':12}" + "".join(f"{lb:>{col_w}}" for lb in labels)
+    print(head); print("-" * len(head))
+    for display, key in _TRAJ_KEYS:
+        row = f"{display:12}"
+        for t in trajs:
+            row += _fmt((t or {}).get(key), col_w)
+        print(row)
+    # n per file
+    n_row = f"{'n':12}" + "".join(f"{(t or {}).get('n', 'n/a'):>{col_w}}" for t in trajs)
+    print(n_row)
 
 
 def _render_type(tname: str, datas: List[Dict[str, Any]], labels: List[str]) -> None:
@@ -65,8 +84,7 @@ def _render_type(tname: str, datas: List[Dict[str, Any]], labels: List[str]) -> 
     if multi:
         head = f"{'concept':32}" + "".join(f"{(primary + '@' + lb):>11}" for lb in labels)
         head += f"{'Δ':>9}{'n':>7}"
-        print(head)
-        print("-" * len(head))
+        print(head); print("-" * len(head))
         for n in names:
             row = f"{n:32}"
             vals = [pc(b, n).get(primary) for b in blocks]
@@ -79,15 +97,13 @@ def _render_type(tname: str, datas: List[Dict[str, Any]], labels: List[str]) -> 
     else:
         cols = [primary] + secondary
         head = f"{'concept':32}" + "".join(f"{c:>11}" for c in cols) + f"{'n':>7}"
-        print(head)
-        print("-" * len(head))
+        print(head); print("-" * len(head))
         for n in names:
             d = pc(blocks[0], n)
             row = f"{n:32}" + "".join(_fmt(d.get(c), 11) for c in cols)
             row += f"{d.get('n', 0):>7}"
             print(row)
 
-    # macro line(s)
     for lb, b in zip(labels, blocks):
         if b:
             macro = "  ".join(f"{k}={_fmt(b.get(k), 0).strip()}" for k in macro_keys)
@@ -98,21 +114,28 @@ def _render_type(tname: str, datas: List[Dict[str, Any]], labels: List[str]) -> 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("metrics", nargs="+", type=Path,
-                    help="One or more metrics_step*.json files (order = column order).")
+    ap.add_argument("metrics", nargs="+", type=Path)
     args = ap.parse_args()
 
-    datas, labels = [], []
+    raws, datas, trajs, labels = [], [], [], []
     for p in args.metrics:
         raw = json.loads(p.read_text())
-        # eval_gen.py nests concept metrics under "concepts"; unwrap transparently.
+        raws.append(raw)
+        # eval_gen.py wraps concept metrics under "concepts"; unwrap transparently.
         datas.append(raw.get("concepts", raw))
+        trajs.append(raw.get("trajectory"))
         labels.append(_label(p))
 
-    if any("loss" in d for d in datas):
-        loss_str = "  ".join(f"{lb}={_fmt(d.get('loss'), 0).strip()}"
-                             for lb, d in zip(labels, datas) if "loss" in d)
-        print(f"val loss:  {loss_str}")
+    # Concept-loss header (present in both formats under different keys).
+    closs_parts = []
+    for lb, raw, d in zip(labels, raws, datas):
+        v = (raw.get("trajectory") or {}).get("concept_loss") or d.get("loss")
+        if v is not None:
+            closs_parts.append(f"{lb}={_fmt(v, 0).strip()}")
+    if closs_parts:
+        print(f"concept loss:  {'  '.join(closs_parts)}")
+
+    _render_trajectory(trajs, labels)
 
     for tname in ("continuous", "binary", "categorical"):
         _render_type(tname, datas, labels)
