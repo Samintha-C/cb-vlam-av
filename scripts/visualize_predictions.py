@@ -196,7 +196,8 @@ def main() -> None:
     backbone = CBVLAMBackbone(
         checkpoint_path=args.base_checkpoint, feature_taps=taps,
         processor_path=args.processor_name, dtype=args.dtype, lora_r=lora_r,
-        adapter_path=str(args.checkpoint_dir / "lora_adapter"), device=args.device)
+        adapter_path=str(args.checkpoint_dir / "lora_adapter"), device=args.device,
+        gradient_checkpointing=False)
     cbl = ConceptBottleneckLayer(in_dim=backbone.feature_dim, layout=layout).to(args.device)
     residual = UnsupervisedResidual(in_dim=backbone.feature_dim, residual_dim=residual_dim).to(args.device)
     head = FinalPredictor(cbl.activation_dim, residual_dim, output_dim=horizon * 2,

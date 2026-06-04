@@ -83,6 +83,7 @@ def _eval_all(backbone, cbl, residual, head, loader, device, manifest, horizon, 
         ade_sum += float((d * wp_valid).sum()); ade_n += float(wp_valid.sum())
         last_valid = wp_valid[:, -1]
         fde_sum += float((d[:, -1] * last_valid).sum()); fde_n += float(last_valid.sum())
+        torch.cuda.empty_cache()
 
     concepts = {"loss": c_sum / max(n, 1.0)}
     if cont_p:
@@ -145,7 +146,8 @@ def main() -> None:
     backbone = CBVLAMBackbone(
         checkpoint_path=args.base_checkpoint, feature_taps=taps,
         processor_path=args.processor_name, dtype=args.dtype, lora_r=lora_r,
-        adapter_path=str(args.checkpoint_dir / "lora_adapter"), device=args.device)
+        adapter_path=str(args.checkpoint_dir / "lora_adapter"), device=args.device,
+        gradient_checkpointing=False)
     cbl = ConceptBottleneckLayer(in_dim=backbone.feature_dim, layout=layout).to(args.device)
     residual = UnsupervisedResidual(in_dim=backbone.feature_dim,
                                     residual_dim=residual_dim).to(args.device)
