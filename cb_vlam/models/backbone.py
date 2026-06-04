@@ -22,6 +22,8 @@ projection. All three are exposed so they can be swapped/compared in experiments
 
 from typing import Sequence, Tuple
 
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -60,6 +62,7 @@ class CBVLAMBackbone(nn.Module):
                  lora_target_modules: Sequence[str] = None,
                  gradient_checkpointing: bool = True,
                  max_image_pixels: int = 262144,
+                 adapter_path: str = None,
                  device: str = "cuda"):
         super().__init__()
         unknown = set(feature_taps) - set(_TAP_SPECS)
@@ -104,6 +107,20 @@ class CBVLAMBackbone(nn.Module):
             task_type="CAUSAL_LM",
         )
         self.model = get_peft_model(base, lora_cfg)
+
+        # Optionally overwrite the freshly-initialized LoRA weights with a saved
+        # adapter (for eval/inference of a trained checkpoint). set_peft_model_state_dict
+        # handles the adapter-name key remapping that a raw load_state_dict would miss.
+        if adapter_path is not None:
+            from peft import set_peft_model_state_dict
+            from safetensors.torch import load_file
+            ad = Path(adapter_path)
+            sf = ad / "adapter_model.safetensors"
+            sd = (load_file(str(sf)) if sf.exists()
+                  else torch.load(ad / "adapter_model.bin", map_location="cpu"))
+            res = set_peft_model_state_dict(self.model, sd)
+            missing = getattr(res, "missing_keys", res)
+            print(f"loaded LoRA adapter from {ad} (set_peft_model_state_dict: {missing})")
 
         # Match Impromptu's training resolution (image_max_pixels=262144 ≈ 512²).
         # The full nuScenes frame (1600×900 ≈ 1.44M px) is ~5.5× larger than the
