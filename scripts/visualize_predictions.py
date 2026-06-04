@@ -31,7 +31,7 @@ import matplotlib.patches as mpatches
 from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, ConcatDataset
 
 from cb_vlam.data.concept_store import ConceptStore
 from cb_vlam.models.backbone import CBVLAMBackbone
@@ -174,7 +174,7 @@ def main() -> None:
     ap.add_argument("--impromptu_test", required=True, type=Path)
     ap.add_argument("--nuscenes_root", required=True, type=Path)
     ap.add_argument("--processor_name", default=None)
-    ap.add_argument("--split", default="test", choices=["train", "val", "test"])
+    ap.add_argument("--split", default="test", choices=["train", "val", "test", "stp3"])
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     ap.add_argument("--n_samples", type=int, default=30, help="pages in the PDF")
     ap.add_argument("--out", type=Path, default=Path("./outputs/predictions.pdf"))
@@ -187,15 +187,23 @@ def main() -> None:
 
     store = ConceptStore(args.concept_store, schema_hash=schema_hash)
     layout = store.manifest["per_type"]
-    ds_full = ConceptDataset(store, args.split, [args.impromptu_train, args.impromptu_test],
-                             args.nuscenes_root, load_image=True, with_trajectory=True,
-                             horizon=horizon)
+    jsons = [args.impromptu_train, args.impromptu_test]
+    if args.split == "stp3":
+        parts = [ConceptDataset(store, s, jsons, args.nuscenes_root,
+                                load_image=True, with_trajectory=True, horizon=horizon)
+                 for s in ("val", "test")]
+        ds_full = ConcatDataset(parts)
+        print(f"split=stp3 (val ∪ test)  total={len(ds_full)}")
+    else:
+        ds_full = ConceptDataset(store, args.split, jsons, args.nuscenes_root,
+                                 load_image=True, with_trajectory=True, horizon=horizon)
+        print(f"split={args.split}  total={len(ds_full)}")
     # Stride-sample evenly across the full split so we get scene diversity
-    # rather than 30 consecutive frames from the same 1-2 scenes.
+    # rather than n consecutive frames from the same 1-2 scenes.
     n = min(args.n_samples, len(ds_full))
     indices = np.linspace(0, len(ds_full) - 1, n, dtype=int).tolist()
     ds = Subset(ds_full, indices)
-    print(f"split={args.split}  total={len(ds_full)}  rendering {len(ds)} evenly-spaced pages")
+    print(f"rendering {len(ds)} evenly-spaced pages")
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=2, collate_fn=collate)
 
     backbone = CBVLAMBackbone(
