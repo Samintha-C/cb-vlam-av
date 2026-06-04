@@ -72,28 +72,69 @@ def _cache_forward(backbone, cbl, residual, loader, device):
     return cat(a_pred), cat(r_all), targets, cat(traj), cat(tmask)
 
 
-def _head_traj(a_int, r, Wc, Wr, b, residual_on):
-    """Linear FinalPredictor: [a ⊕ r] → waypoints; r dropped when residual_off."""
+def _head_traj(a_int, r_use, Wc, Wr, b):
+    """Linear FinalPredictor: [a ⊕ r] → waypoints; r_use=None drops the residual."""
     out = a_int @ Wc.t() + b
-    if residual_on:
-        out = out + r @ Wr.t()
+    if r_use is not None:
+        out = out + r_use @ Wr.t()
     return out
 
 
-def _curve_for_rank(rank, sup, a_pred, a_gt, c2col, Wc, Wr, b, r,
+def _curve_for_rank(rank, sup, a_pred, a_gt, c2col, Wc, Wr, b, r, r_mean,
                     gt_wp, valid_wp, horizon, C):
-    """Sweep budget m=0..C for one ordering; return {residual_on/off: {metric:[...]}}."""
-    res = {mode: {m: [] for m in _METRICS} for mode in ("residual_on", "residual_off")}
+    """Sweep budget m=0..C for one ordering, over three residual modes:
+
+      residual_on   = real r            (realistic end-to-end steerability)
+      residual_mean = train-mean r̄      (FAIR concepts-only: head sees a typical r)
+      residual_off  = 0                 (strict ablation; off-distribution — the head
+                                         never saw r=0, so its absolute value is biased)
+    """
+    modes = {"residual_on": r, "residual_mean": r_mean, "residual_off": None}
+    res = {mode: {k: [] for k in _METRICS} for mode in modes}
     N = a_pred.shape[0]
     for m in range(C + 1):
         sel = (rank < m) & sup
         a_int = IV.apply(a_pred, a_gt, sel, c2col)
-        for mode, on in (("residual_on", True), ("residual_off", False)):
-            traj = _head_traj(a_int, r, Wc, Wr, b, on).reshape(N, horizon, 2)
+        for mode, r_use in modes.items():
+            traj = _head_traj(a_int, r_use, Wc, Wr, b).reshape(N, horizon, 2)
             met = trajectory_l2(traj, gt_wp, valid_wp, horizon)
             for k in _METRICS:
                 res[mode][k].append(met.get(k))
     return res
+
+
+@torch.no_grad()
+def _single_concept_diagnostic(catalog, a_pred, a_gt, sup, c2col, Wc, Wr, b, r,
+                               gt_wp, valid_wp, horizon):
+    """ΔL2 from intervening EACH concept ALONE (residual on), with the two factors
+    that gate it: prediction error (|GT−pred| in activation space, supervised mean)
+    and a column-fair weight (‖W‖/√k, so the 3-slot categorical isn't inflated).
+
+    A concept can only move the trajectory if it is BOTH mispredicted AND used by
+    the head — this table separates those, so 'why intervention doesn't help' is
+    attributable per concept.
+    """
+    N, C = a_pred.shape[0], len(catalog)
+    base = trajectory_l2(_head_traj(a_pred, r, Wc, Wr, b).reshape(N, horizon, 2),
+                         gt_wp, valid_wp, horizon)["l2_avg"]
+    err = (a_pred - a_gt).abs()
+    rows = []
+    for c, meta in enumerate(catalog):
+        sel = torch.zeros((N, C), dtype=torch.bool, device=a_pred.device)
+        sel[:, c] = True
+        sel = sel & sup
+        a_int = IV.apply(a_pred, a_gt, sel, c2col)
+        l2 = trajectory_l2(_head_traj(a_int, r, Wc, Wr, b).reshape(N, horizon, 2),
+                           gt_wp, valid_wp, horizon)["l2_avg"]
+        cols = slice(meta["col0"], meta["col0"] + meta["k"])
+        m = sup[:, c]
+        perr = float(err[m][:, cols].sum(-1).mean()) if bool(m.any()) else 0.0
+        wn = float(Wc[:, cols].norm())
+        rows.append({"concept": meta["name"], "kind": meta["kind"],
+                     "delta_l2": l2 - base, "pred_error": perr, "weight_norm": wn,
+                     "weight_norm_per_col": wn / (meta["k"] ** 0.5), "n_sup": int(m.sum())})
+    rows.sort(key=lambda d: d["delta_l2"])   # most-helpful (most negative) first
+    return base, rows
 
 
 def main() -> None:
@@ -163,16 +204,20 @@ def main() -> None:
     Wc = head.concept_weight.detach().float()                  # (out, A)
     Wr = head.fc.weight[:, head.concept_dim:].detach().float()  # (out, residual_dim)
     b = head.fc.bias.detach().float()                          # (out,)
+    r_mean = r.mean(0, keepdim=True).expand_as(r)              # typical residual (fair ablation)
 
     # ── Importance table (the model's "most important concepts") ─────────────
     imp = SEL.importance_scores(Wc, catalog, N, a_pred, scale_by_activation=False)[0]
     importance_table = sorted(
         [{"concept": catalog[c]["name"], "kind": catalog[c]["kind"],
-          "weight_norm": float(imp[c])} for c in range(C)],
-        key=lambda d: -d["weight_norm"])
-    print("\nMost important concepts (linear-weight norm):")
+          "weight_norm": float(imp[c]),
+          "weight_norm_per_col": float(imp[c]) / (catalog[c]["k"] ** 0.5)}
+         for c in range(C)],
+        key=lambda d: -d["weight_norm_per_col"])   # column-fair ranking
+    print("\nMost important concepts (column-fair ‖W‖/√k | raw ‖W‖):")
     for row in importance_table[:8]:
-        print(f"  {row['concept']:32} {row['kind']:11} {row['weight_norm']:.3f}")
+        print(f"  {row['concept']:32} {row['kind']:11} "
+              f"{row['weight_norm_per_col']:.3f}  (raw {row['weight_norm']:.3f})")
 
     # ── Sweep: orderings × budget × residual ─────────────────────────────────
     curves = {}
@@ -182,7 +227,7 @@ def main() -> None:
     for s in range(args.rand_seeds):
         g = torch.Generator(device=args.device).manual_seed(1234 + s)
         rk = SEL.rank_of(SEL.random_scores(N, C, args.device, g), sup)
-        cur = _curve_for_rank(rk, sup, a_pred, a_gt, c2col, Wc, Wr, b, r,
+        cur = _curve_for_rank(rk, sup, a_pred, a_gt, c2col, Wc, Wr, b, r, r_mean,
                               gt_wp, valid_wp, horizon, C)
         if rand_acc is None:
             rand_acc = cur
@@ -198,20 +243,34 @@ def main() -> None:
     # IMP — global linear-weight importance (optionally CCTP-scaled).
     imp_scores = SEL.importance_scores(Wc, catalog, N, a_pred, scale_by_activation=args.cctp)
     curves["imp"] = _curve_for_rank(SEL.rank_of(imp_scores, sup), sup, a_pred, a_gt,
-                                    c2col, Wc, Wr, b, r, gt_wp, valid_wp, horizon, C)
+                                    c2col, Wc, Wr, b, r, r_mean, gt_wp, valid_wp, horizon, C)
 
     # LCP — oracle GT-error ordering.
     lcp = SEL.lcp_scores(a_pred, a_gt, sup, catalog)
     curves["lcp"] = _curve_for_rank(SEL.rank_of(lcp, sup), sup, a_pred, a_gt,
-                                    c2col, Wc, Wr, b, r, gt_wp, valid_wp, horizon, C)
+                                    c2col, Wc, Wr, b, r, r_mean, gt_wp, valid_wp, horizon, C)
 
     # ── Report + write ───────────────────────────────────────────────────────
     base = curves["imp"]["residual_on"]["l2_avg"][0]   # m=0 = the model's own prediction
-    print(f"\nbaseline L2_avg (no intervention) = {base:.3f} m")
+    base_mean = curves["imp"]["residual_mean"]["l2_avg"][0]
+    print(f"\nbaseline L2_avg (no intervention)  residual_on={base:.3f}  "
+          f"residual_mean={base_mean:.3f} m")
+    print("  → if intervening all concepts toward GT barely changes residual_on, the "
+          "bottleneck is not steering the trajectory (residual dominates).")
     for ordering in ("rand", "imp", "lcp"):
         on = curves[ordering]["residual_on"]["l2_avg"][-1]
+        mean = curves[ordering]["residual_mean"]["l2_avg"][-1]
         off = curves[ordering]["residual_off"]["l2_avg"][-1]
-        print(f"  all-{C}-intervened [{ordering:4}]  residual_on={on:.3f}  residual_off={off:.3f}")
+        print(f"  all-{C}-intervened [{ordering:4}]  on={on:.3f}  mean={mean:.3f}  off={off:.3f}")
+
+    # Per-concept single-intervention diagnostic (does accuracy/usage gate ΔL2?).
+    base_single, per_concept = _single_concept_diagnostic(
+        catalog, a_pred, a_gt, sup, c2col, Wc, Wr, b, r, gt_wp, valid_wp, horizon)
+    print(f"\nPer-concept single intervention (residual on, baseline={base_single:.3f}):")
+    print(f"  {'concept':30}{'kind':11}{'ΔL2':>8}{'pred_err':>10}{'W/√k':>8}")
+    for row in per_concept[:6] + per_concept[-3:]:   # best helpers + worst hurters
+        print(f"  {row['concept']:30}{row['kind']:11}{row['delta_l2']:>+8.4f}"
+              f"{row['pred_error']:>10.3f}{row['weight_norm_per_col']:>8.3f}")
 
     out = args.out or (args.checkpoint_dir.parent / "intervention_curve.json")
     out.write_text(json.dumps({
@@ -221,6 +280,7 @@ def main() -> None:
                  "metrics": _METRICS},
         "x": list(range(C + 1)),
         "importance_table": importance_table,
+        "per_concept": per_concept,
         "curves": curves,
     }, indent=2))
     print(f"\nwrote {out}")

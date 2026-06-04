@@ -36,53 +36,109 @@ def _style(ax, title, xlabel, ylabel):
         s.set_edgecolor(_GRID)
 
 
+# residual modes present in the JSON → (panel title, key). residual_mean is the
+# fair concepts-only ablation (train-mean r); residual_off (r=0) is off-distribution.
+_MODES = [("residual_on", "residual ON (realistic)"),
+          ("residual_mean", "residual = train-mean  (fair concepts-only)"),
+          ("residual_off", "residual OFF = 0  (off-distribution)")]
+
+
+def _panel(ax, x, curves, metric, mode, show_baseline):
+    for ordering in ("rand", "imp", "lcp"):
+        if ordering not in curves or mode not in curves[ordering]:
+            continue
+        ax.plot(x, curves[ordering][mode][metric], "-", color=_COLORS[ordering],
+                lw=2.2, label=_LABELS[ordering])
+    if show_baseline:
+        base = curves["imp"][mode][metric][0]
+        ax.axhline(base, color="white", lw=0.8, ls=":", alpha=0.6)
+        ax.text(x[-1], base, " baseline", color="white", fontsize=8,
+                va="bottom", ha="right")
+
+
 def _curve_page(data, metric):
     x = data["x"]
     curves = data["curves"]
-    fig, ax = plt.subplots(figsize=(11, 7))
+    # Only plot residual modes that are actually present in this run.
+    modes = [(k, t) for (k, t) in _MODES
+             if any(k in curves[o] for o in curves)]
+    fig, axes = plt.subplots(1, len(modes), figsize=(7 * len(modes), 6.5))
+    if len(modes) == 1:
+        axes = [axes]
     fig.patch.set_facecolor(_BG)
-    for ordering in ("rand", "imp", "lcp"):
-        if ordering not in curves:
-            continue
-        c = _COLORS[ordering]
-        on = curves[ordering]["residual_on"][metric]
-        off = curves[ordering]["residual_off"][metric]
-        ax.plot(x, on, "-", color=c, lw=2.2, label=f"{_LABELS[ordering]} · resid ON")
-        ax.plot(x, off, "--", color=c, lw=1.6, alpha=0.85,
-                label=f"{_LABELS[ordering]} · resid OFF")
-    base = curves["imp"]["residual_on"][metric][0]
-    ax.axhline(base, color="white", lw=0.8, ls=":", alpha=0.6)
-    ax.text(x[-1], base, "  no-intervention baseline", color="white",
-            fontsize=8, va="bottom", ha="right")
-    _style(ax, f"Concept intervention — {metric} vs #concepts corrected (GT)",
-           "# concepts intervened (most-important-first)", f"{metric}  (m)")
-    n = data["meta"]["n"]
-    ax.legend(loc="upper right", fontsize=8.5, facecolor=_BG, edgecolor="none",
-              labelcolor="white", ncol=1)
-    ax.text(0.01, 0.01, f"split={data['meta']['split']}  n={n}  "
-            f"rand_seeds={data['meta']['rand_seeds']}  imp={data['meta']['imp_kind']}",
-            transform=ax.transAxes, color="#9aa0b5", fontsize=8)
+    # Each panel auto-scales independently — on (~0.4) and off (~6.5) no longer
+    # share a y-axis, so the near-flat steering signal is actually visible.
+    for ax, (key, title) in zip(axes, modes):
+        _panel(ax, x, curves, metric, key, show_baseline=True)
+        _style(ax, title, "# concepts intervened (most-important-first)", f"{metric}  (m)")
+        ax.legend(loc="best", fontsize=8.5, facecolor=_BG, edgecolor="none",
+                  labelcolor="white")
+    m = data["meta"]
+    fig.suptitle(f"Concept intervention — {metric} vs #concepts corrected (GT)   "
+                 f"[split={m['split']}  n={m['n']}  rand_seeds={m['rand_seeds']}  "
+                 f"imp={m['imp_kind']}]", color="white", fontsize=12)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
+_KCOL = {"continuous": "#5dade2", "binary": "tomato", "categorical": "gold"}
+
+
+def _importance_page(data):
+    # Column-fair ‖W‖/√k (so the 3-slot categorical isn't √3-inflated).
+    table = sorted(data["importance_table"], key=lambda r: r["weight_norm_per_col"])
+    names = [r["concept"] for r in table]
+    vals = [r["weight_norm_per_col"] for r in table]
+    kinds = [r["kind"] for r in table]
+    fig, ax = plt.subplots(figsize=(11, max(7, len(names) * 0.32)))
+    fig.patch.set_facecolor(_BG)
+    ax.barh(np.arange(len(names)), vals,
+            color=[_KCOL.get(k, "white") for k in kinds], height=0.7)
+    ax.set_yticks(np.arange(len(names)))
+    ax.set_yticklabels(names, fontsize=7.5, color="white")
+    _style(ax, "Concept importance — column-fair linear-weight norm  ‖W‖/√k",
+           "‖W[:, concept]‖ / √(#cols)  (contribution to trajectory)", "")
+    handles = [plt.Rectangle((0, 0), 1, 1, color=_KCOL[k]) for k in _KCOL]
+    ax.legend(handles, list(_KCOL), loc="lower right", fontsize=8,
+              facecolor=_BG, edgecolor="none", labelcolor="white")
     plt.tight_layout()
     return fig
 
 
-def _importance_page(data):
-    table = data["importance_table"]
-    names = [r["concept"] for r in table][::-1]
-    vals = [r["weight_norm"] for r in table][::-1]
-    kinds = [r["kind"] for r in table][::-1]
-    kcol = {"continuous": "#5dade2", "binary": "tomato", "categorical": "gold"}
-    fig, ax = plt.subplots(figsize=(11, max(7, len(names) * 0.32)))
+def _per_concept_page(data):
+    """Single-intervention ΔL2 per concept + ΔL2-vs-prediction-error scatter."""
+    pc = data.get("per_concept")
+    if not pc:
+        return None
+    fig, (axb, axs) = plt.subplots(1, 2, figsize=(18, max(7, len(pc) * 0.32)),
+                                   gridspec_kw={"width_ratios": [1.4, 1.0]})
     fig.patch.set_facecolor(_BG)
-    ax.barh(np.arange(len(names)), vals,
-            color=[kcol.get(k, "white") for k in kinds], height=0.7)
-    ax.set_yticks(np.arange(len(names)))
-    ax.set_yticklabels(names, fontsize=7.5, color="white")
-    _style(ax, "Concept importance — FinalPredictor linear-weight norm",
-           "‖W[:, concept]‖  (contribution to trajectory)", "")
-    handles = [plt.Rectangle((0, 0), 1, 1, color=kcol[k]) for k in kcol]
-    ax.legend(handles, list(kcol), loc="lower right", fontsize=8,
-              facecolor=_BG, edgecolor="none", labelcolor="white")
+
+    # left: ΔL2 bars (sorted helpful→harmful); green = helps (ΔL2<0), red = hurts.
+    rows = sorted(pc, key=lambda r: r["delta_l2"], reverse=True)
+    names = [r["concept"] for r in rows]
+    dl = [r["delta_l2"] for r in rows]
+    axb.barh(np.arange(len(rows)), dl,
+             color=["mediumseagreen" if v < 0 else "tomato" for v in dl], height=0.7)
+    axb.set_yticks(np.arange(len(rows)))
+    axb.set_yticklabels(names, fontsize=7.5, color="white")
+    axb.axvline(0, color="white", lw=0.8, alpha=0.6)
+    _style(axb, "Per-concept single intervention (residual on)",
+           "ΔL2_avg vs no-intervention  (m)   [<0 helps, >0 hurts]", "")
+
+    # right: does prediction error predict steering effect? (expect NO correlation
+    # if the bottleneck is non-causal — that's the finding).
+    pe = np.array([r["pred_error"] for r in pc])
+    dla = np.array([r["delta_l2"] for r in pc])
+    kinds = [r["kind"] for r in pc]
+    axs.scatter(pe, dla, c=[_KCOL.get(k, "white") for k in kinds], s=40)
+    axs.axhline(0, color="white", lw=0.8, alpha=0.6)
+    if len(pe) > 1 and pe.std() > 0:
+        rho = float(np.corrcoef(pe, dla)[0, 1])
+        axs.set_title(f"ΔL2 vs prediction error   (corr={rho:+.2f})",
+                      color="white", fontsize=11, pad=8)
+    _style(axs, axs.get_title() or "ΔL2 vs prediction error",
+           "prediction error |GT−pred| (activation space)", "ΔL2_avg  (m)")
     plt.tight_layout()
     return fig
 
@@ -100,9 +156,13 @@ def main() -> None:
         for metric in args.metrics:
             pdf.savefig(_curve_page(data, metric), facecolor=_BG)
             plt.close()
+        pc_page = _per_concept_page(data)
+        if pc_page is not None:
+            pdf.savefig(pc_page, facecolor=_BG)
+            plt.close()
         pdf.savefig(_importance_page(data), facecolor=_BG)
         plt.close()
-    print(f"wrote {args.out}  ({len(args.metrics)} curve pages + importance)")
+    print(f"wrote {args.out}  ({len(args.metrics)} curve pages + per-concept + importance)")
 
 
 if __name__ == "__main__":
