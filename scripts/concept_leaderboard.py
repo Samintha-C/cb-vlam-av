@@ -104,7 +104,9 @@ def main() -> None:
 
     datas, labels = [], []
     for p in args.metrics:
-        datas.append(json.loads(p.read_text()))
+        raw = json.loads(p.read_text())
+        # eval_gen.py nests concept metrics under "concepts"; unwrap transparently.
+        datas.append(raw.get("concepts", raw))
         labels.append(_label(p))
 
     if any("loss" in d for d in datas):

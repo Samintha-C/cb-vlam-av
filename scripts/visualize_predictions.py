@@ -31,7 +31,7 @@ import matplotlib.patches as mpatches
 from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from cb_vlam.data.concept_store import ConceptStore
 from cb_vlam.models.backbone import CBVLAMBackbone
@@ -187,10 +187,15 @@ def main() -> None:
 
     store = ConceptStore(args.concept_store, schema_hash=schema_hash)
     layout = store.manifest["per_type"]
-    ds = ConceptDataset(store, args.split, [args.impromptu_train, args.impromptu_test],
-                        args.nuscenes_root, load_image=True, with_trajectory=True,
-                        horizon=horizon, max_samples=args.n_samples)
-    print(f"split={args.split}  rendering {len(ds)} pages")
+    ds_full = ConceptDataset(store, args.split, [args.impromptu_train, args.impromptu_test],
+                             args.nuscenes_root, load_image=True, with_trajectory=True,
+                             horizon=horizon)
+    # Stride-sample evenly across the full split so we get scene diversity
+    # rather than 30 consecutive frames from the same 1-2 scenes.
+    n = min(args.n_samples, len(ds_full))
+    indices = np.linspace(0, len(ds_full) - 1, n, dtype=int).tolist()
+    ds = Subset(ds_full, indices)
+    print(f"split={args.split}  total={len(ds_full)}  rendering {len(ds)} evenly-spaced pages")
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=2, collate_fn=collate)
 
     backbone = CBVLAMBackbone(
