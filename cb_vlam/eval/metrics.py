@@ -27,6 +27,41 @@ except Exception:  # pragma: no cover
 
 
 @torch.no_grad()
+def trajectory_l2(pred, gt, valid, horizon: int) -> Dict[str, float]:
+    """ADE/FDE + the ST-P3 / Impromptu-q7 cumulative L2 @ {1s,2s,3s,Avg}.
+
+    Mirrors the cross-checked core in cb_vlam.eval.eval_gen: ADE/FDE use the raw
+    per-waypoint L2; the ST-P3 numbers use the cumulative mean (/2,/4,/6) with the
+    q7 4-way sign-flip min, whose closed form is
+    ``sqrt((|gx|-|px|)^2 + (|gy|-|py|)^2)`` (min over (±x,±y), x/y independent).
+
+    Args:
+        pred, gt: (N, horizon, 2) tensors in meters (ego frame).
+        valid:    (N, horizon) per-waypoint validity (bool/float).
+    """
+    valid = valid.to(pred.dtype)
+    d = ((pred - gt) ** 2).sum(-1).clamp(min=0).sqrt()                 # raw L2 (N,H)
+    ade = float((d * valid).sum() / valid.sum().clamp(min=1.0))
+    last = valid[:, -1]
+    fde = float((d[:, -1] * last).sum() / last.sum().clamp(min=1.0))
+
+    dsf = (((gt[..., 0].abs() - pred[..., 0].abs()) ** 2
+            + (gt[..., 1].abs() - pred[..., 1].abs()) ** 2).clamp(min=0).sqrt())
+    cum = dsf.cumsum(dim=1)
+    valid_upto = valid.cumprod(dim=1)
+    out = {"ade_m": ade, "fde_m": fde}
+    l2_vals = []
+    for key, idx in (("l2_1s", 1), ("l2_2s", 3), ("l2_3s", 5)):
+        if idx < horizon:
+            v = valid_upto[:, idx]
+            val = float(((cum[:, idx] / (idx + 1)) * v).sum() / v.sum().clamp(min=1.0))
+            out[key] = val
+            l2_vals.append(val)
+    out["l2_avg"] = sum(l2_vals) / max(len(l2_vals), 1)
+    return out
+
+
+@torch.no_grad()
 def evaluate(backbone, cbl, loader, device: str,
              manifest: Dict[str, Any], max_batches: Optional[int] = None,
              bin_pos_weight=None) -> Dict[str, Any]:
