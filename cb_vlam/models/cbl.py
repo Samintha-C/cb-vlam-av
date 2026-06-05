@@ -132,3 +132,34 @@ class ConceptBottleneckLayer(nn.Module):
         for logits in out["categorical_logits"]:
             parts.append(torch.softmax(logits, dim=-1))
         return torch.cat(parts, dim=-1)
+
+    def gt_activations(self, targets: Dict[str, torch.Tensor]):
+        """Ground-truth concept-activation vector + per-column supervised mask.
+
+        Same layout/space as ``to_activations`` (continuous value, binary ∈{0,1},
+        categorical one-hot), built from the dataset targets — for TEACHER-FORCING
+        the FinalPredictor on ground truth (Koh-2020 "independent" training, which
+        makes test-time concept intervention in-distribution for the head).
+
+        Returns (gt_vec, sup_mask), both (B, activation_dim); ``sup_mask`` is True
+        on columns whose concept has GT for that sample.
+        """
+        import torch.nn.functional as F
+        ref = self._ref_param()
+        dtype = ref.dtype if ref is not None else torch.float32
+        device = (ref.device if ref is not None
+                  else next(t.device for t in targets.values()))
+        gt_parts: List[torch.Tensor] = []
+        mask_parts: List[torch.Tensor] = []
+        if self.n_continuous:
+            gt_parts.append(targets["continuous"].to(device, dtype))
+            mask_parts.append(targets["continuous_mask"].to(device, dtype))
+        if self.n_binary:
+            gt_parts.append(targets["binary"].to(device, dtype))
+            mask_parts.append(targets["binary_mask"].to(device, dtype))
+        for ti, k in enumerate(self.cat_ncats):
+            gt_parts.append(F.one_hot(targets["categorical"][:, ti].long().to(device),
+                                      num_classes=k).to(dtype))
+            m = targets["categorical_mask"][:, ti].to(device, dtype)
+            mask_parts.append(m.unsqueeze(-1).expand(-1, k))
+        return torch.cat(gt_parts, dim=-1), torch.cat(mask_parts, dim=-1) > 0.5

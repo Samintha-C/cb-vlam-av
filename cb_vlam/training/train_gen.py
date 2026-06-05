@@ -90,6 +90,15 @@ def _adv_lambda(step: int, args) -> float:
     return args.lambda_adv * min(1.0, step / args.adv_warmup)
 
 
+def _tf_prob(step, args):
+    """Teacher-forcing probability at this step: 1.0 (pure IND) unless annealed→0 (JNT)."""
+    if not args.teacher_force:
+        return 0.0
+    if args.tf_anneal <= 0:
+        return 1.0
+    return max(0.0, 1.0 - step / args.tf_anneal)
+
+
 def _backbone_feats(backbone, batch):
     """Stack the per-sample backbone features (the one expensive forward)."""
     return torch.stack(
@@ -131,6 +140,15 @@ def main() -> None:
                          "the divergence the fused-GRL form showed cannot recur.")
     ap.add_argument("--adv_warmup", type=int, default=0,
                     help="opt steps to ramp lambda_adv 0→max (0 = CB-LLM's no-ramp).")
+    ap.add_argument("--teacher_force", action="store_true",
+                    help="Feed GROUND-TRUTH concept activations to the FinalPredictor "
+                         "during the task loss (Koh-2020 'independent' training). Makes "
+                         "test-time intervention in-distribution → attacks the +0.83 "
+                         "OOD-perturbation effect. L_c still trains the CBL on GT as usual.")
+    ap.add_argument("--tf_anneal", type=int, default=0,
+                    help="Scheduled sampling: opt steps to anneal teacher-forcing prob "
+                         "1.0→0.0 (IND→JNT curriculum). 0 = constant full teacher-forcing "
+                         "(pure IND). Ignored unless --teacher_force.")
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_accum", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=1)
@@ -209,7 +227,22 @@ def main() -> None:
             lam = _adv_lambda(step, args)
 
             # 1) MAIN — concepts + trajectory + sparsity → backbone, CBL, residual, head
-            cbl_out, r, traj = _predict(modules, feats)
+            cbl_out = modules.cbl(feats)
+            cvec_pred = modules.cbl.to_activations(cbl_out)
+            r = modules.residual(feats)
+            # Teacher forcing (IND): feed GT concepts (where supervised) to the head's
+            # task path, per-sample with prob p, so L_t learns the TRUE concept→traj
+            # map. Detached → no L_t gradient into the concept path for those samples;
+            # L_c still trains the CBL on cbl_out below. p=0 ⇒ standard JNT (predicted).
+            p_tf = _tf_prob(step, args)
+            if p_tf > 0.0:
+                gt_vec, sup = modules.cbl.gt_activations(targets)
+                cvec_tf = torch.where(sup, gt_vec, cvec_pred.detach())
+                use_tf = torch.rand(feats.shape[0], 1, device=args.device) < p_tf
+                cvec_head = torch.where(use_tf, cvec_tf, cvec_pred)
+            else:
+                cvec_head = cvec_pred
+            traj = modules.head(cvec_head, r)
             Lc = concept_loss(cbl_out, targets, bin_pos_weight=pos_weight)["total"]
             Lt = trajectory_loss(traj, traj_gt, mask=traj_mask)
             Lreg = elastic_net_penalty(modules.head.concept_weight)
@@ -243,7 +276,8 @@ def main() -> None:
                     print(f"e{epoch} step{step}  main={win['main']/n:.4f} "
                           f"(c={win['c']/n:.3f} t={win['t']/n:.3f})  "
                           f"adv={win['adv']/n:.3f} dis={win['dis']/n:.3f}  "
-                          f"λadv={lam:.2f} lr={sched.get_last_lr()[0]:.2e}  {rate:.2f} smp/s "
+                          f"λadv={lam:.2f} tf={_tf_prob(step, args):.2f} "
+                          f"lr={sched.get_last_lr()[0]:.2e}  {rate:.2f} smp/s "
                           f"[mean/{n}]", flush=True)
                     win = {"main": 0.0, "c": 0.0, "t": 0.0, "adv": 0.0, "dis": 0.0, "n": 0}
 
@@ -325,6 +359,7 @@ def _save(out_dir: Path, backbone, modules: GenerationModules, store, args, taps
         "horizon": args.horizon, "lora_r": args.lora_r, "checkpoint": args.checkpoint,
         "lambda_traj": args.lambda_traj, "lambda_reg": args.lambda_reg,
         "lambda_adv": args.lambda_adv,
+        "teacher_force": args.teacher_force, "tf_anneal": args.tf_anneal,
     }, indent=2))
 
 
