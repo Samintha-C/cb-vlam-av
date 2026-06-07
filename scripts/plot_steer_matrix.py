@@ -192,9 +192,12 @@ def _overlay_page(rows: dict):
 
         for cell, r in rows.items():
             method = r["method"]
-            base   = r["baseline"]
             C      = r["n_concepts"]
             frac   = [m / C for m in r["x"]]
+            # Normalise each curve by ITS OWN m=0 value (residual-on and
+            # residual-mean have different baselines — using on[0] for the mean
+            # curve gives a meaningless ~-300% offset).
+            base   = r[ckey]["imp"][0]
             pct    = [(base - v) / base * 100 for v in r[ckey]["imp"]]
             ax.plot(frac, pct,
                     ls="-" if method == "ind" else "--",
@@ -202,7 +205,7 @@ def _overlay_page(rows: dict):
                     label=f"{cell}  (base={base:.3f}m)")
 
         # Tight y: zoom around [-0.5%, max_pct+0.3%], floor at -0.5
-        all_pcts = [(rows[c]["baseline"] - v) / rows[c]["baseline"] * 100
+        all_pcts = [(rows[c][ckey]["imp"][0] - v) / rows[c][ckey]["imp"][0] * 100
                     for c in rows for v in rows[c][ckey]["imp"]]
         ylo = min(min(all_pcts) - 0.1, -0.2)
         yhi = max(max(all_pcts) + 0.15, 0.1)
