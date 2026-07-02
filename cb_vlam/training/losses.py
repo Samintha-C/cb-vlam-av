@@ -190,6 +190,90 @@ def trajectory_loss(pred: torch.Tensor,
     return _masked_mean(per_elem, mask)
 
 
+def _traj_dist_per_sample(pred: torch.Tensor,
+                          target: torch.Tensor,
+                          mask: Optional[torch.Tensor],
+                          beta: float = 1.0) -> torch.Tensor:
+    """Per-sample masked smooth-L1 waypoint distance → (B,).
+
+    Same objective as ``trajectory_loss`` but reduced per row instead of to a
+    scalar, so a margin can be taken between two trajectories sample-by-sample.
+    """
+    per = F.smooth_l1_loss(pred, target.to(pred.dtype), beta=beta, reduction="none")
+    if mask is None:
+        return per.mean(-1)
+    if mask.dim() == 1:
+        mask = mask[:, None].expand_as(per)
+    m = mask.to(per.dtype)
+    return (per * m).sum(-1) / m.sum(-1).clamp(min=1.0)
+
+
+def steerability_loss(head,
+                      cvec_pred: torch.Tensor,
+                      gt_vec: torch.Tensor,
+                      sup_mask: torch.Tensor,
+                      residual: torch.Tensor,
+                      traj_gt: torch.Tensor,
+                      traj_mask: Optional[torch.Tensor] = None,
+                      *,
+                      margin: float = 0.0,
+                      beta: float = 1.0) -> torch.Tensor:
+    """Intervention-consistency loss L_steer (CB-SAE-style, ported to trajectory).
+
+    CB-SAE (Trustworthy-ML-Lab, arXiv:2512.10805) turns steerability from a
+    test-time probe into a *training* signal: it performs the intervention inside
+    the forward pass and penalises the model when the intervention fails to move
+    the output the intended way. Our failure mode is the residual bypass — under
+    the Koh/Shin test-time protocol, correcting all concepts to ground truth moves
+    L2 by ~1 mm because the linear head routes the trajectory through the residual,
+    not the concept columns. L_steer attacks exactly that: it requires that
+    swapping the head's concept input from the model's own prediction to GROUND
+    TRUTH make the trajectory *measurably better*, forcing the concept block of the
+    head to become load-bearing.
+
+    Concretely, with the linear head F([c ⊕ r]) = W_c·c + W_r·r + b and a shared,
+    detached residual r:
+
+        d_gt   = ‖F(c*, r) − y*‖            (concepts → GT)
+        d_pred = ‖F(ĉ, r) − y*‖  (detached) (concepts → model prediction)
+        L_steer = mean( relu( d_gt − d_pred + margin ) )
+
+    The reference term d_pred is detached so the loss never *worsens* the base
+    prediction to satisfy the margin. Because r is shared and detached, the
+    trajectory *gap* F(c*,r) − F(ĉ,r) = W_c·(c*−ĉ) is common-mode-cancelled in
+    W_r — the steerability differential the margin scores can only be moved by the
+    concept columns W_c, which is precisely the authority the residual bypass has
+    starved. (W_r may still adapt to fit the GT-corrected trajectory to y*; that
+    is aligned, not cheating, since the differential stays owned by W_c.) The
+    concept inputs are detached (this trains the HEAD, not the CBL — concept
+    accuracy stays owned by L_c) and r is detached (the residual stays owned by
+    the disentanglement term); with the intended confined backward, L_steer
+    touches only the final predictor's weights.
+
+    Args:
+        head: the FinalPredictor (linear ``F([c ⊕ r])``).
+        cvec_pred: (B, C) predicted concept activations (``cbl.to_activations``).
+        gt_vec, sup_mask: (B, C) GT activations + supervised mask from
+            ``cbl.gt_activations`` — GT is injected only where supervised.
+        residual: (B, R) residual vector r (detached internally).
+        traj_gt: (B, traj_dim) ground-truth waypoints y*.
+        traj_mask: optional (B,) or (B, traj_dim) validity mask.
+        margin: metres the GT-corrected trajectory must beat the predicted one by
+            (0 = "at least as good"); a small positive value applies real pressure.
+        beta: Huber transition point, matching ``trajectory_loss``.
+
+    Returns:
+        Scalar L_steer (0 when every sample already clears the margin).
+    """
+    c_gt = torch.where(sup_mask, gt_vec, cvec_pred.detach())
+    r = residual.detach()
+    traj_c_gt = head(c_gt, r)
+    traj_c_pred = head(cvec_pred.detach(), r)
+    d_gt = _traj_dist_per_sample(traj_c_gt, traj_gt, traj_mask, beta)
+    d_pred = _traj_dist_per_sample(traj_c_pred, traj_gt, traj_mask, beta).detach()
+    return torch.relu(d_gt - d_pred + margin).mean()
+
+
 def elastic_net_penalty(weight: torch.Tensor, alpha: float = 0.99) -> torch.Tensor:
     """Elastic-net sparsity penalty on the final predictor's concept weights.
 

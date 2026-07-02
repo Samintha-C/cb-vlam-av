@@ -54,7 +54,7 @@ from cb_vlam.models.final_predictor import FinalPredictor
 from cb_vlam.training.dataset import ConceptDataset, collate
 from cb_vlam.training.losses import (
     concept_loss, adversary_loss, disentanglement_loss, trajectory_loss,
-    elastic_net_penalty, binary_pos_weight_from_manifest)
+    steerability_loss, elastic_net_penalty, binary_pos_weight_from_manifest)
 
 
 class GenerationModules:
@@ -149,6 +149,17 @@ def main() -> None:
                     help="Scheduled sampling: opt steps to anneal teacher-forcing prob "
                          "1.0→0.0 (IND→JNT curriculum). 0 = constant full teacher-forcing "
                          "(pure IND). Ignored unless --teacher_force.")
+    ap.add_argument("--lambda_steer", type=float, default=0.0,
+                    help="Weight on the CB-SAE-style intervention-consistency loss "
+                         "L_steer (0 = off). L_steer requires that correcting the head's "
+                         "concept input to GROUND TRUTH improve the trajectory vs the "
+                         "predicted-concept trajectory, forcing the concept columns of the "
+                         "head to be load-bearing (attacks the residual bypass). Confined "
+                         "to the FinalPredictor's params (does not move backbone/CBL/residual).")
+    ap.add_argument("--steer_margin", type=float, default=0.0,
+                    help="Metres the GT-corrected trajectory must beat the predicted one "
+                         "by for L_steer to be satisfied (0 = 'at least as good'). A small "
+                         "positive value (e.g. 0.05) applies real steerability pressure.")
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_accum", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=1)
@@ -211,9 +222,10 @@ def main() -> None:
     # ── Train ─────────────────────────────────────────────────────────────────
     best_val = math.inf
     step = micro = samples_seen = 0
-    win = {"main": 0.0, "c": 0.0, "t": 0.0, "adv": 0.0, "dis": 0.0, "n": 0}
+    win = {"main": 0.0, "c": 0.0, "t": 0.0, "steer": 0.0, "adv": 0.0, "dis": 0.0, "n": 0}
     adv_params = list(modules.adversary.parameters())
     res_params = list(modules.residual.parameters())
+    head_params = list(modules.head.parameters())
     opt.zero_grad()
     backbone.model.train(); modules.train()
     t0 = time.time()
@@ -249,12 +261,28 @@ def main() -> None:
             Lmain = Lc + args.lambda_traj * Lt + args.lambda_reg * Lreg
             (Lmain / args.grad_accum).backward()
 
-            # 2) ADVERSARY probe — read concepts off r → ONLY the adversary's params
+            # 2) STEER — CB-SAE-style intervention consistency → ONLY the head.
+            #    Requires that correcting the head's concept input to GROUND TRUTH
+            #    beat the predicted-concept trajectory, forcing the concept columns
+            #    of the linear head to be load-bearing (attacks the residual bypass
+            #    that pins Δon≈0). Concept inputs + residual are detached inside the
+            #    loss (CBL owned by L_c, residual by L_dis), and the backward is
+            #    confined to head_params, so this term only reshapes F([c⊕r]).
+            if args.lambda_steer > 0.0:
+                gt_vec, sup = modules.cbl.gt_activations(targets)
+                Lsteer = steerability_loss(
+                    modules.head, cvec_pred, gt_vec, sup, r,
+                    traj_gt, traj_mask, margin=args.steer_margin)
+                (args.lambda_steer * Lsteer / args.grad_accum).backward(inputs=head_params)
+            else:
+                Lsteer = torch.zeros((), device=args.device)
+
+            # 3) ADVERSARY probe — read concepts off r → ONLY the adversary's params
             adv_out = modules.adversary(r.detach())
             Ladv = adversary_loss(adv_out, targets, bin_pos_weight=pos_weight)["total"]
             (Ladv / args.grad_accum).backward(inputs=adv_params)
 
-            # 3) DISENTANGLE — push r to the probe's uninformative prior → ONLY residual.
+            # 4) DISENTANGLE — push r to the probe's uninformative prior → ONLY residual.
             #    feats detached so the adversarial signal never reaches the backbone.
             dis_out = modules.adversary(modules.residual(feats.detach()))
             Ldis = disentanglement_loss(dis_out, targets)["total"]
@@ -263,6 +291,7 @@ def main() -> None:
             micro += 1
             samples_seen += len(batch["prompts"])
             win["main"] += Lmain.item(); win["c"] += Lc.item(); win["t"] += Lt.item()
+            win["steer"] += Lsteer.item()
             win["adv"] += Ladv.item(); win["dis"] += Ldis.item(); win["n"] += 1
 
             if micro % args.grad_accum == 0:
@@ -275,11 +304,14 @@ def main() -> None:
                     rate = samples_seen / (time.time() - t0)
                     print(f"e{epoch} step{step}  main={win['main']/n:.4f} "
                           f"(c={win['c']/n:.3f} t={win['t']/n:.3f})  "
+                          f"steer={win['steer']/n:.4f}  "
                           f"adv={win['adv']/n:.3f} dis={win['dis']/n:.3f}  "
-                          f"λadv={lam:.2f} tf={_tf_prob(step, args):.2f} "
+                          f"λadv={lam:.2f} λsteer={args.lambda_steer:.2f} "
+                          f"tf={_tf_prob(step, args):.2f} "
                           f"lr={sched.get_last_lr()[0]:.2e}  {rate:.2f} smp/s "
                           f"[mean/{n}]", flush=True)
-                    win = {"main": 0.0, "c": 0.0, "t": 0.0, "adv": 0.0, "dis": 0.0, "n": 0}
+                    win = {"main": 0.0, "c": 0.0, "t": 0.0, "steer": 0.0,
+                           "adv": 0.0, "dis": 0.0, "n": 0}
 
                 if step % args.eval_every == 0:
                     best_val = _do_eval(backbone, modules, val_loader, store, pos_weight,
@@ -359,6 +391,7 @@ def _save(out_dir: Path, backbone, modules: GenerationModules, store, args, taps
         "horizon": args.horizon, "lora_r": args.lora_r, "checkpoint": args.checkpoint,
         "lambda_traj": args.lambda_traj, "lambda_reg": args.lambda_reg,
         "lambda_adv": args.lambda_adv,
+        "lambda_steer": args.lambda_steer, "steer_margin": args.steer_margin,
         "teacher_force": args.teacher_force, "tf_anneal": args.tf_anneal,
     }, indent=2))
 
