@@ -44,22 +44,37 @@ def _style(ax, title="", xlabel="", ylabel=""):
         s.set_edgecolor(_GRID)
 
 
-def load_cells(runs_dir: Path) -> dict:
+def _default_parse(cell: str) -> dict:
+    """Cell name → {rdim, method} for the r{dim}_{method} steer-matrix naming."""
+    rdim_str, method = cell.rsplit("_", 1)
+    return {"rdim": int(rdim_str[1:]), "method": method}
+
+
+def load_cells(runs_dir: Path, cells=None, parse=None,
+               prefix: str = "gen_regression_steer_") -> dict:
+    """Load per-cell intervention_curve.json into the row schema the pages read.
+
+    Generic over cell naming: ``cells`` is the list of run-dir suffixes and
+    ``parse`` maps each suffix to the metadata keys the pages need (default:
+    the r{dim}_{method} steer-matrix scheme). Reused by plot_lsteer_sweep.py,
+    which passes its own cells + a lambda_steer parse.
+    """
+    cells = CELLS if cells is None else cells
+    parse = parse or _default_parse
     rows = {}
-    for cell in CELLS:
-        p = runs_dir / f"gen_regression_steer_{cell}" / "intervention_curve.json"
+    for cell in cells:
+        p = runs_dir / f"{prefix}{cell}" / "intervention_curve.json"
         if not p.exists():
             print(f"  SKIP {cell} — {p} not found")
             continue
         d = json.loads(p.read_text())
-        rdim_str, method = cell.rsplit("_", 1)
-        rdim = int(rdim_str[1:])
+        meta = parse(cell)
         c = d["curves"]
         on   = c["imp"]["residual_on"]["l2_avg"]
         mean = c["imp"]["residual_mean"]["l2_avg"]
         off  = c["imp"]["residual_off"]["l2_avg"]
         rows[cell] = {
-            "cell": cell, "rdim": rdim, "method": method,
+            "cell": cell, **meta,
             "x": d["x"],
             "n_concepts": d["meta"]["n_concepts"],
             "n": d["meta"]["n"],
