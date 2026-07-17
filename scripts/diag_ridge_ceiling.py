@@ -174,6 +174,10 @@ def main():
     ap.add_argument("--max_train", type=int, default=None, help="cap train rows (debug)")
     ap.add_argument("--max_eval", type=int, default=None, help="cap eval rows (debug)")
     ap.add_argument("--skip_a2", action="store_true", help="skip the HGB nonlinear ceiling")
+    ap.add_argument("--ego_kinematics", type=Path, default=None,
+                    help="ego_kinematics.json from mine_ego_kinematics.py → adds A5 "
+                         "(concepts + named measured kinematics) and A6 (concepts + raw "
+                         "14-dim history block) to the ceiling table + a Phase-1 gate.")
     args = ap.parse_args()
 
     np.random.seed(args.seed)
@@ -261,6 +265,53 @@ def main():
         results[aid] = {"name": name, "metric": m, "alpha": alpha, "mean_r2": r2m,
                         "coef_norms_top10": _concept_coef_norms(coef, catalog, idx)[:10]}
 
+    # A5 / A6 — Route-A vocabulary extension: concepts + measured ego kinematics.
+    # A5 = concepts ⊕ 4 named finite-difference kinematics (the proposed measured
+    # concepts); A6 = concepts ⊕ raw 14-dim history block (the upper bound A5 is a
+    # summary of). The gate: is A5 ≤ ~1.0 m AND does A5 recover most of what the raw
+    # history (A6) adds — i.e. are the named summaries a sufficient statistic?
+    if args.ego_kinematics:
+        kin = json.loads(args.ego_kinematics.read_text())
+        knames = list(next(iter(kin.values()))["norm"].keys())
+        z_k = [0.0] * len(knames); z_h = [0.0] * len(next(iter(kin.values()))["hist14"])
+
+        def _kin_mats(tokens):
+            K = np.array([[kin[t]["norm"][n] for n in knames] if t in kin else z_k
+                          for t in tokens], dtype=np.float64)
+            H = np.array([kin[t]["hist14"] if t in kin else z_h
+                          for t in tokens], dtype=np.float64)
+            return K, H
+
+        Ktr, Htr = _kin_mats(tok_tr)
+        Kev, Hev = _kin_mats(tok_ev)
+        n_missing = sum(t not in kin for t in tok_tr) + sum(t not in kin for t in tok_ev)
+        for aid, name, Etr, Eev, is_kin in [
+            ("A5", "ridge — concepts + named kinematics (measured)", Ktr, Kev, True),
+            ("A6", "ridge — concepts + raw 14-dim history block", Htr, Hev, False)]:
+            Xtr2 = np.concatenate([Xtr_c, Etr[comp_tr]], axis=1)
+            Xev2 = np.concatenate([Xev, Eev], axis=1)
+            p, coef, alpha = _fit_ridge(Xtr2, ytr_c, Xev2, alphas, args.seed)
+            _, r2m = _per_dim_r2(p, yev, vev)
+            entry = {"name": name, "metric": _score(p, yev, vev, args.horizon),
+                     "alpha": alpha, "mean_r2": r2m}
+            if is_kin:
+                kc = coef[:, A:]                              # appended kinematic columns
+                entry["kin_coef_norms"] = {knames[i]: float(np.linalg.norm(kc[:, i]))
+                                           for i in range(len(knames))}
+            results[aid] = entry
+
+        a1 = results["A1"]["metric"]["l2_avg"]
+        a5 = results["A5"]["metric"]["l2_avg"]; a6 = results["A6"]["metric"]["l2_avg"]
+        total = a1 - a6                                       # full improvement raw history buys
+        frac = (a1 - a5) / total if total > 1e-6 else 1.0     # share captured by NAMED kinematics
+        results["gate"] = {
+            "a1_concepts": a1, "a5_named": a5, "a6_raw_history": a6,
+            "named_vs_raw_gap_m": a5 - a6, "frac_recovered_by_named": frac,
+            "n_missing_tokens": int(n_missing),
+            "criterion": "PASS iff A5 ≤ 1.0 m AND named kinematics recover ≥80% of the "
+                         "concepts→raw-history (A1→A6) improvement",
+            "pass": bool(a5 <= 1.0 and frac >= 0.8)}
+
     # A1-pred (predicted concepts) — requires an eval-activation dump on disk.
     # run_intervention caches a_pred in memory and writes only curve summaries
     # (run_intervention.py:276-285), so no dump exists → skipped by design (no
@@ -316,10 +367,25 @@ def _render_md(p):
          f"n_train {p['n_train']} (complete {p['n_train_complete']}) · n_eval {p['n_eval']}\n",
          "| id | model | L2@1s | L2@2s | L2@3s | L2 Avg | ADE | FDE | notes |",
          "|---|---|---|---|---|---|---|---|---|"]
-    for tag in ("A0", "A1", "A2", "A3", "A4"):
+    for tag in ("A0", "A1", "A2", "A3", "A4", "A5", "A6"):
         if tag in r and "metric" in r[tag]:
             L.append(_mrow(tag, r[tag]))
     L.append("")
+    if "gate" in r:
+        g = r["gate"]
+        L.append(f"\n**Phase-1 gate — {'PASS ✅' if g['pass'] else 'NO-GO ❌'}**  "
+                 f"({g['criterion']})")
+        L.append(f"- A1 concepts-only = {g['a1_concepts']:.3f} m → "
+                 f"A5 +named kinematics = **{g['a5_named']:.3f} m** → "
+                 f"A6 +raw history = {g['a6_raw_history']:.3f} m")
+        L.append(f"- named vs raw gap = {g['named_vs_raw_gap_m']:+.3f} m; "
+                 f"named kinematics recover **{100*g['frac_recovered_by_named']:.0f}%** "
+                 f"of the concepts→raw-history improvement "
+                 f"(sufficient-statistic check).")
+        if "A5" in r and "kin_coef_norms" in r["A5"]:
+            ks = ", ".join(f"{k}={v:.2f}" for k, v in r["A5"]["kin_coef_norms"].items())
+            L.append(f"- A5 kinematic |coef| (standardized): {ks}")
+        L.append("")
     L.append(f"Reference: trained concepts-only (residual=train-mean) = "
              f"**{p['ref_concepts_only_l2avg']} m**; full model (residual on) = "
              f"**{p['ref_full_l2avg']} m**.")

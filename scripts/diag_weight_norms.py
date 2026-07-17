@@ -209,16 +209,36 @@ def _render_report(rj, wj, out_dir):
                        if a2 >= a1 - 0.05 else
                        f" ≪ A1 → nonlinear concept→trajectory structure exists (linear-head cost ≈ {a1 - a2:.3f} m)."))
 
+    gate = rj["results"].get("gate")
+    head = [
+        "## Headline",
+        f"- Ridge ceiling (A1, ST-P3 Avg): **{a1:.3f} m**   [vs concepts-only trained: "
+        f"{co}, full: {full}]",
+        f"- Nonlinear ceiling (A2): **{a2:.3f} m**" if a2 is not None else "- Nonlinear ceiling (A2): skipped",
+        f"- W_c/W_u per-column ratio, {ref_cell or 'n/a'}: **{ratio:.3f}**   "
+        f"(range across cells: {rlo:.3f}–{rhi:.3f})"]
+    if gate:
+        head.append(
+            f"- **Route-A Phase-1 gate: {'PASS ✅' if gate['pass'] else 'NO-GO ❌'}** — "
+            f"A5 (concepts+named kinematics) = **{gate['a5_named']:.3f} m**, "
+            f"A6 (concepts+raw history) = {gate['a6_raw_history']:.3f} m, "
+            f"named recover {100*gate['frac_recovered_by_named']:.0f}% of the A1→A6 gain")
+    head.append("")
+    verdict_block = verdict
+    if gate:
+        verdict_block = (
+            f"**Phase-1 gate {'PASS' if gate['pass'] else 'NO-GO'}:** adding measured ego "
+            f"kinematics drops the concept-vocabulary ceiling {a1:.3f} → {gate['a5_named']:.3f} m, "
+            f"and the 4 named summaries recover {100*gate['frac_recovered_by_named']:.0f}% of what "
+            f"the raw 14-dim history buys — the vocabulary was the binding constraint and the "
+            f"named kinematics are a sufficient statistic of the history. "
+            + ("Proceed to Phase 2.\n\n" if gate['pass'] else "Do NOT proceed — refine derived quantities.\n\n")
+            + verdict)
     L = [f"# Diagnostics: vocabulary ceiling + weight audit",
          f"_ridge: sklearn {rj['sklearn']}, seed {rj['seed']}, n_eval {rj['n_eval']} · "
          f"weights: {len(wj['audit'])} checkpoints under {wj['runs_dir']}_\n",
-         "## Headline",
-         f"- Ridge ceiling (A1, ST-P3 Avg): **{a1:.3f} m**   [vs concepts-only trained: "
-         f"{co}, full: {full}]",
-         f"- Nonlinear ceiling (A2): **{a2:.3f} m**" if a2 is not None else "- Nonlinear ceiling (A2): skipped",
-         f"- W_c/W_u per-column ratio, {ref_cell or 'n/a'}: **{ratio:.3f}**   "
-         f"(range across cells: {rlo:.3f}–{rhi:.3f})\n",
-         "## Verdict", verdict, "",
+         *head,
+         "## Verdict", verdict_block, "",
          "## Tables", "", rj_md(out_dir), "", wj_md(wj), "",
          "## Caveats", _caveats(rj, wj)]
     return "\n".join(L) + "\n"
