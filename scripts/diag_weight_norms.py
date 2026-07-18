@@ -219,20 +219,22 @@ def _render_report(rj, wj, out_dir):
         f"(range across cells: {rlo:.3f}–{rhi:.3f})"]
     if gate:
         head.append(
-            f"- **Route-A Phase-1 gate: {'PASS ✅' if gate['pass'] else 'NO-GO ❌'}** — "
+            f"- **Route-A gate: {'GO ✅' if gate['pass'] else 'NO-GO ❌'}** — "
             f"A5 (concepts+named kinematics) = **{gate['a5_named']:.3f} m**, "
             f"A6 (concepts+raw history) = {gate['a6_raw_history']:.3f} m, "
             f"named recover {100*gate['frac_recovered_by_named']:.0f}% of the A1→A6 gain")
     head.append("")
     verdict_block = verdict
     if gate:
+        a7 = f" proprioception-only (A7) = {gate['a7_proprioception']:.3f} m;" if "a7_proprioception" in gate else ""
         verdict_block = (
-            f"**Phase-1 gate {'PASS' if gate['pass'] else 'NO-GO'}:** adding measured ego "
+            f"**Route-A gate {'GO' if gate['pass'] else 'NO-GO'}:** adding measured ego "
             f"kinematics drops the concept-vocabulary ceiling {a1:.3f} → {gate['a5_named']:.3f} m, "
             f"and the 4 named summaries recover {100*gate['frac_recovered_by_named']:.0f}% of what "
             f"the raw 14-dim history buys — the vocabulary was the binding constraint and the "
-            f"named kinematics are a sufficient statistic of the history. "
+            f"named kinematics are a sufficient statistic of the history.{a7} "
             + ("Proceed to Phase 2.\n\n" if gate['pass'] else "Do NOT proceed — refine derived quantities.\n\n")
+            + (f"_Override note:_ {gate['override_note']}\n\n" if gate.get("override_note") else "")
             + verdict)
     L = [f"# Diagnostics: vocabulary ceiling + weight audit",
          f"_ridge: sklearn {rj['sklearn']}, seed {rj['seed']}, n_eval {rj['n_eval']} · "
